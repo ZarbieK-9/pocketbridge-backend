@@ -84,6 +84,9 @@ logger.info('CORS configuration', {
 
 app.use(cors(corsOptions));
 
+// Handle CORS preflight for all routes
+app.options('*', cors(corsOptions));
+
 // Compression
 app.use(compression());
 
