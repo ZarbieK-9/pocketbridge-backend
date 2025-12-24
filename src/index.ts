@@ -118,7 +118,7 @@ app.use(securityHeaders);
 
 // Lightweight user context from header (temporary until auth is added)
 app.use((req, _res, next) => {
-  const userId = req.get('X-User-ID');
+  const userId = req.get('X-User-ID') || (req.query.userId as string | undefined);
   if (userId) {
     (req as any).userId = userId;
   }
