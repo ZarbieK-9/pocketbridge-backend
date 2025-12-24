@@ -31,7 +31,7 @@ const router = Router();
 
 /**
  * Get all devices for current user
- * GET /api/me/devices
+ * GET /api/devices
  */
 router.get('/devices', async (req: Request, res: Response) => {
   try {
@@ -47,13 +47,12 @@ router.get('/devices', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    // Get all devices for user
+    // Get all devices for user (from devices table)
     const result = await database.query(
       `SELECT 
-        device_id, device_name, device_type, device_os,
-        is_online, last_seen, ip_address,
-        registered_at
-       FROM user_devices
+        device_id, device_name, device_type,
+        last_seen, created_at
+       FROM devices
        WHERE user_id = $1
        ORDER BY last_seen DESC`,
       [userId]
@@ -63,10 +62,8 @@ router.get('/devices', async (req: Request, res: Response) => {
       device_id: row.device_id,
       device_name: row.device_name,
       device_type: row.device_type,
-      device_os: row.device_os,
-      is_online: row.is_online,
+      is_online: sessionsMap ? sessionsMap.has(row.device_id) : false,
       last_seen: new Date(row.last_seen).getTime(),
-      ip_address: row.ip_address,
     }));
 
     return res.json({ devices, count: devices.length });
@@ -78,7 +75,7 @@ router.get('/devices', async (req: Request, res: Response) => {
 
 /**
  * Get device details
- * GET /api/me/devices/:deviceId
+ * GET /api/devices/:deviceId
  */
 router.get('/devices/:deviceId', async (req: Request, res: Response) => {
   try {
@@ -94,7 +91,7 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
     }
 
     const result = await database.query(
-      `SELECT * FROM user_devices
+      `SELECT * FROM devices
        WHERE device_id = $1 AND user_id = $2`,
       [deviceId, userId]
     );
@@ -109,10 +106,9 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
       device_name: device.device_name,
       device_type: device.device_type,
       device_os: device.device_os,
-      is_online: device.is_online,
+      is_online: sessionsMap ? sessionsMap.has(device.device_id) : false,
       last_seen: new Date(device.last_seen).getTime(),
-      ip_address: device.ip_address,
-      registered_at: new Date(device.registered_at).getTime(),
+      registered_at: new Date(device.created_at).getTime(),
     });
   } catch (error) {
     logger.error('Failed to get device', {}, error instanceof Error ? error : new Error(String(error)));
@@ -122,7 +118,7 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
 
 /**
  * Rename device
- * POST /api/me/devices/:deviceId/rename
+ * POST /api/devices/:deviceId/rename
  */
 router.post('/devices/:deviceId/rename', async (req: Request, res: Response) => {
   try {
@@ -144,7 +140,7 @@ router.post('/devices/:deviceId/rename', async (req: Request, res: Response) => 
 
     // Verify device belongs to user
     const checkResult = await database.query(
-      `SELECT user_id FROM user_devices WHERE device_id = $1`,
+      `SELECT user_id FROM devices WHERE device_id = $1`,
       [deviceId]
     );
 
@@ -158,7 +154,7 @@ router.post('/devices/:deviceId/rename', async (req: Request, res: Response) => 
 
     // Update device name
     const updateResult = await database.query(
-      `UPDATE user_devices
+      `UPDATE devices
        SET device_name = $1
        WHERE device_id = $2
        RETURNING *`,
@@ -184,7 +180,7 @@ router.post('/devices/:deviceId/rename', async (req: Request, res: Response) => 
 
 /**
  * Remove/revoke device
- * DELETE /api/me/devices/:deviceId
+ * DELETE /api/devices/:deviceId
  */
 router.delete('/devices/:deviceId', async (req: Request, res: Response) => {
   try {
@@ -213,24 +209,11 @@ router.delete('/devices/:deviceId', async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Cannot remove another user\'s device' });
     }
 
-    // Invalidate all sessions for this device
+    // Hard delete device; events referencing it will cascade if configured
     await database.query(
-      `UPDATE user_sessions
-       SET is_active = false
-       WHERE device_id = $1`,
-      [deviceId]
+      `DELETE FROM devices WHERE device_id = $1 AND user_id = $2`,
+      [deviceId, userId]
     );
-
-    // Mark device as offline (soft delete)
-    await database.query(
-      `UPDATE user_devices
-       SET is_online = false
-       WHERE device_id = $1`,
-      [deviceId]
-    );
-
-    // Could also hard delete:
-    // await database.query(`DELETE FROM user_devices WHERE device_id = $1`, [deviceId]);
 
     logger.info('Device removed', { userId, deviceId });
 
@@ -246,7 +229,7 @@ router.delete('/devices/:deviceId', async (req: Request, res: Response) => {
 
 /**
  * Get real-time presence (online/offline status of all user's devices)
- * GET /api/me/presence
+ * GET /api/presence
  * 
  * Could also be WebSocket for real-time:
  * - Client: { type: 'subscribe_presence' }
@@ -265,8 +248,8 @@ router.get('/presence', async (req: Request, res: Response) => {
     }
 
     const result = await database.query(
-      `SELECT device_id, device_name, is_online, last_seen
-       FROM user_devices
+      `SELECT device_id, device_name, last_seen
+       FROM devices
        WHERE user_id = $1
        ORDER BY last_seen DESC`,
       [userId]
@@ -275,7 +258,7 @@ router.get('/presence', async (req: Request, res: Response) => {
     const devices = result.rows.map((row: any) => ({
       device_id: row.device_id,
       device_name: row.device_name,
-      is_online: row.is_online,
+      is_online: sessionsMap ? sessionsMap.has(row.device_id) : false,
       last_seen: new Date(row.last_seen).getTime(),
     }));
 
