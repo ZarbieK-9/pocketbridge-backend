@@ -46,12 +46,34 @@ app.use(helmet({
 }));
 
 // CORS - Must be before other middleware
+// Build dynamic CORS options with whitelist + sensible defaults
+const allowedOrigins = Array.isArray(config.cors.origin)
+  ? (config.cors.origin as string[])
+  : [config.cors.origin as string];
+
 const corsOptions: cors.CorsOptions = {
-  origin: config.cors.origin,
+  origin: (origin, callback) => {
+    // Allow non-browser or same-origin requests
+    if (!origin) return callback(null, true);
+    // If no whitelist configured, allow all origins (recommended to set CORS_ORIGIN in production)
+    if (allowedOrigins.length === 0) return callback(null, true);
+    // If wildcard configured, allow all origins (credentials should be false when using '*')
+    if (allowedOrigins.includes('*')) return callback(null, true);
+    // Exact match against whitelist
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Attempt relaxed host-only matching (handles trailing slashes/protocol differences)
+    try {
+      const o = new URL(origin);
+      const originHost = `${o.protocol}//${o.host}`;
+      if (allowedOrigins.includes(originHost)) return callback(null, true);
+    } catch {}
+    callback(new Error(`CORS: Origin ${origin} not allowed`));
+  },
   credentials: config.cors.credentials,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  optionsSuccessStatus: 200, // Some legacy browsers (IE11, various SmartTVs) choke on 204
+  // Include custom headers used by frontend
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID', 'X-Requested-With'],
+  optionsSuccessStatus: 200,
   preflightContinue: false,
 };
 
