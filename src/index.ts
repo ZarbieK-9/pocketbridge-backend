@@ -33,6 +33,7 @@ import { getMetrics } from './routes/metrics.js';
 import adminRouter, { setDatabase } from './routes/admin.js';
 import pairingRouter, { setDatabase as setPairingDatabase } from './routes/pairing.js';
 import statusRouter, { setSessionsMap } from './routes/status.js';
+import devicesRouter, { setDatabase as setDevicesDatabase, setSessionsMap as setDevicesSessionsMap } from './routes/devices.js';
 
 const app = express();
 
@@ -50,6 +51,10 @@ app.use(helmet({
 const allowedOrigins = Array.isArray(config.cors.origin)
   ? (config.cors.origin as string[])
   : [config.cors.origin as string];
+// Normalize to avoid trailing-slash mismatches
+const normalizedAllowedOrigins = allowedOrigins
+  .filter(Boolean)
+  .map((o) => o.replace(/\/+$/, ''));
 
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
@@ -60,12 +65,12 @@ const corsOptions: cors.CorsOptions = {
     // If wildcard configured, allow all origins (credentials should be false when using '*')
     if (allowedOrigins.includes('*')) return callback(null, true);
     // Exact match against whitelist
-    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (normalizedAllowedOrigins.includes((origin || '').replace(/\/+$/, ''))) return callback(null, true);
     // Attempt relaxed host-only matching (handles trailing slashes/protocol differences)
     try {
       const o = new URL(origin);
       const originHost = `${o.protocol}//${o.host}`;
-      if (allowedOrigins.includes(originHost)) return callback(null, true);
+      if (normalizedAllowedOrigins.includes(originHost)) return callback(null, true);
     } catch {}
     // Don't error; respond without CORS headers so browser blocks without 500
     callback(null, false);
@@ -111,6 +116,15 @@ app.use(requestLogger);
 // Security headers
 app.use(securityHeaders);
 
+// Lightweight user context from header (temporary until auth is added)
+app.use((req, _res, next) => {
+  const userId = req.get('X-User-ID');
+  if (userId) {
+    (req as any).userId = userId;
+  }
+  next();
+});
+
 // Health check endpoint (no rate limiting)
 app.get('/health', async (req, res) => {
   const dbHealthy = db ? await db.healthCheck() : false;
@@ -142,6 +156,9 @@ app.use('/api/pairing', pairingRouter);
 
 // Status routes
 app.use('/api', statusRouter);
+
+// Devices routes
+app.use('/api', devicesRouter);
 
 // 404 handler
 app.use((req, res) => {
@@ -215,6 +232,9 @@ async function start() {
     // Set database for pairing routes
     setPairingDatabase(db);
 
+    // Set database for devices routes
+    setDevicesDatabase(db);
+
     // Initialize Redis
     redis = await initRedis();
     logger.info('Redis connected');
@@ -222,6 +242,7 @@ async function start() {
     // Create WebSocket gateway
     const sessions = createWebSocketGateway(wss, { db, redis });
     setSessionsMap(sessions);
+    setDevicesSessionsMap(sessions);
     logger.info('WebSocket gateway ready');
 
     // Start TTL cleanup job
