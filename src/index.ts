@@ -67,7 +67,8 @@ const corsOptions: cors.CorsOptions = {
       const originHost = `${o.protocol}//${o.host}`;
       if (allowedOrigins.includes(originHost)) return callback(null, true);
     } catch {}
-    callback(new Error(`CORS: Origin ${origin} not allowed`));
+    // Don't error; respond without CORS headers so browser blocks without 500
+    callback(null, false);
   },
   credentials: config.cors.credentials,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
