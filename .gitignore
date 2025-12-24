@@ -1,0 +1,52 @@
+# Node & TypeScript
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Temporary files
+.tmp/
+tmp/
+.temp/
+*.tmp
+*.pid
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Environment files (keep examples committed)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*
+!.env.example
+!env.example
+
+# Docker / runtime artifacts
+# (actual Dockerfiles are committed; ignore generated runtime metadata)
+*.nft.json
+
+docker-compose.override.yml
+
+# Keys / certificates (generated locally)
+*.key
+*.pem
+
+# DB / cache dumps
+*.rdb
+*.sqlite
+*.db
