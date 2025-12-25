@@ -127,8 +127,9 @@ export async function verifyEd25519(publicKeyHex: string, data: Buffer | string,
   if (typeof data === 'string') {
     dataBytes = new TextEncoder().encode(data);
   } else if (Buffer.isBuffer(data)) {
-    // Convert Buffer to Uint8Array explicitly
-    dataBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    // Convert Buffer to Uint8Array - create a new array to avoid buffer sharing issues
+    dataBytes = new Uint8Array(data.length);
+    dataBytes.set(data);
   } else {
     dataBytes = new Uint8Array(data);
   }
