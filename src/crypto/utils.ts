@@ -272,13 +272,8 @@ export function validateNonce(nonce: string): boolean {
 export function hashForSignature(...parts: (Buffer | string | object)[]): Buffer {
   const hash = crypto.createHash('sha256');
   for (const part of parts) {
-    if (Buffer.isBuffer(part)) {
-      hash.update(part);
-    } else if (typeof part === 'string') {
-      hash.update(Buffer.from(part, 'utf8'));
-    } else {
-      hash.update(Buffer.from(JSON.stringify(part), 'utf8'));
-    }
+    // Always convert to string, then to UTF-8 bytes (to match client)
+    hash.update(Buffer.from(String(part), 'utf8'));
   }
   return hash.digest();
 }
