@@ -79,18 +79,8 @@ export async function handleHandshake(
     (ws as any)._handshakeCleanupAttached = true;
   }
   if (!state) {
-    logger.warn('No handshake state found, creating new state with step=client_hello', {
-      wsReadyState: ws.readyState,
-    });
     state = { step: 'client_hello' };
     handshakeStates.set(ws, state);
-  } else {
-    logger.info(`Existing handshake state found: step=${state.step}`, {
-      hasNonceC: !!state.nonceC,
-      hasNonceS: !!state.nonceS,
-      hasServerEphemeralKeypair: !!state.serverEphemeralKeypair,
-      hasSessionKeys: !!state.sessionKeys,
-    });
   }
 
 
@@ -302,7 +292,12 @@ async function handleClientAuth(
   const serverEphemeralPubHex = state.serverEphemeralKeypair.publicKey;
   
   // Log the exact values being hashed for debugging
-  logger.info(`Server hashing signature data with: user_id=${message.user_id.substring(0, 16)}..., device_id=${message.device_id}, nonceC=${state.nonceC}, nonceS=${state.nonceS}, serverEphemeralPub=${serverEphemeralPubHex.substring(0, 16)}...`);
+  // Show only keys for debug
+  logger.info(`[KEYS] user_id: ${message.user_id}`);
+  logger.info(`[KEYS] device_id: ${message.device_id}`);
+  logger.info(`[KEYS] nonceC: ${state.nonceC}`);
+  logger.info(`[KEYS] nonceS: ${state.nonceS}`);
+  logger.info(`[KEYS] serverEphemeralPub: ${serverEphemeralPubHex}`);
   
   // Hash the signature data in the same order as the client
   const signatureData = hashForSignature(
@@ -315,8 +310,7 @@ async function handleClientAuth(
   
   // Log the computed hash for comparison with client (use INFO level so it's visible)
   const signatureDataHex = Buffer.from(signatureData).toString('hex');
-  logger.info(`Server computed signature data hash: ${signatureDataHex.substring(0, 32)}... (length: ${signatureDataHex.length})`);
-  logger.info('Client should have computed the same hash. Compare with client logs.');
+  logger.info(`[KEYS] signatureDataHash: ${signatureDataHex}`);
 
   // Verify signature using hex format (user_id is Ed25519 public key in hex)
   const publicKeyHex = message.user_id;
@@ -326,7 +320,7 @@ async function handleClientAuth(
   }
 
   // Verify signature using tweetnacl-compatible hex format
-  logger.info(`Verifying client signature - PublicKey: ${publicKeyHex.substring(0, 16)}..., SignatureDataHash: ${signatureDataHex.substring(0, 32)}..., ClientSignature: ${message.client_signature.substring(0, 32)}...`);
+  logger.info(`[KEYS] clientSignature: ${message.client_signature}`);
 
   const isValid = await verifyEd25519(
     publicKeyHex,
@@ -335,11 +329,7 @@ async function handleClientAuth(
   );
 
   if (!isValid) {
-    logger.warn('Client signature verification failed', {
-      publicKeyHex: publicKeyHex.substring(0, 16) + '...',
-      signatureDataHex: Buffer.from(signatureData).toString('hex').substring(0, 32) + '...',
-      clientSignatureHex: message.client_signature.substring(0, 32) + '...',
-    });
+    // No log except keys
     resetHandshakeStateOnError(ws, 'invalid_client_signature');
     return { success: false, error: 'Invalid client signature' };
   }
