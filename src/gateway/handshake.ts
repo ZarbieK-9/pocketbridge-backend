@@ -323,12 +323,12 @@ async function handleClientAuth(
     [message.user_id]
   );
 
-  // Get or create device and get last_ack_device_seq
+  // Get or create device in multi-schema and get last_ack_device_seq
   const deviceResult = await db.pool.query(
-    `INSERT INTO devices (device_id, user_id, last_ack_device_seq)
-     VALUES ($1, $2, 0)
-     ON CONFLICT (device_id) 
-     DO UPDATE SET last_seen = NOW()
+    `INSERT INTO user_devices (device_id, user_id, last_ack_device_seq, is_online, last_seen)
+     VALUES ($1::uuid, $2, 0, TRUE, NOW())
+     ON CONFLICT (device_id)
+     DO UPDATE SET last_seen = NOW(), is_online = TRUE
      RETURNING last_ack_device_seq`,
     [message.device_id, message.user_id]
   );

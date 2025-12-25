@@ -48,11 +48,11 @@ router.get('/devices', async (req: Request, res: Response) => {
     }
 
     // Get all devices for user (from devices table)
-    const result = await database.query(
+    const result = await database.pool.query(
       `SELECT 
-        device_id, device_name, device_type,
-        last_seen, created_at
-       FROM devices
+        device_id, device_name, device_type, device_os,
+        last_seen, registered_at, ip_address
+       FROM user_devices
        WHERE user_id = $1
        ORDER BY last_seen DESC`,
       [userId]
@@ -62,8 +62,10 @@ router.get('/devices', async (req: Request, res: Response) => {
       device_id: row.device_id,
       device_name: row.device_name,
       device_type: row.device_type,
+      device_os: row.device_os,
       is_online: sessionsMap ? sessionsMap.has(row.device_id) : false,
       last_seen: new Date(row.last_seen).getTime(),
+      ip_address: row.ip_address || undefined,
     }));
 
     return res.json({ devices, count: devices.length });
@@ -90,9 +92,9 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    const result = await database.query(
-      `SELECT * FROM devices
-       WHERE device_id = $1 AND user_id = $2`,
+    const result = await database.pool.query(
+      `SELECT * FROM user_devices
+       WHERE device_id = $1::uuid AND user_id = $2`,
       [deviceId, userId]
     );
 
@@ -108,7 +110,7 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
       device_os: device.device_os,
       is_online: sessionsMap ? sessionsMap.has(device.device_id) : false,
       last_seen: new Date(device.last_seen).getTime(),
-      registered_at: new Date(device.created_at).getTime(),
+      registered_at: new Date(device.registered_at).getTime(),
     });
   } catch (error) {
     logger.error('Failed to get device', {}, error instanceof Error ? error : new Error(String(error)));
@@ -139,8 +141,8 @@ router.post('/devices/:deviceId/rename', async (req: Request, res: Response) => 
     }
 
     // Verify device belongs to user
-    const checkResult = await database.query(
-      `SELECT user_id FROM devices WHERE device_id = $1`,
+    const checkResult = await database.pool.query(
+      `SELECT user_id FROM user_devices WHERE device_id = $1::uuid`,
       [deviceId]
     );
 
@@ -153,10 +155,10 @@ router.post('/devices/:deviceId/rename', async (req: Request, res: Response) => 
     }
 
     // Update device name
-    const updateResult = await database.query(
-      `UPDATE devices
+    const updateResult = await database.pool.query(
+      `UPDATE user_devices
        SET device_name = $1
-       WHERE device_id = $2
+       WHERE device_id = $2::uuid
        RETURNING *`,
       [device_name, deviceId]
     );
@@ -196,8 +198,8 @@ router.delete('/devices/:deviceId', async (req: Request, res: Response) => {
     }
 
     // Verify device belongs to user
-    const checkResult = await database.query(
-      `SELECT user_id FROM user_devices WHERE device_id = $1`,
+    const checkResult = await database.pool.query(
+      `SELECT user_id FROM user_devices WHERE device_id = $1::uuid`,
       [deviceId]
     );
 
@@ -210,8 +212,8 @@ router.delete('/devices/:deviceId', async (req: Request, res: Response) => {
     }
 
     // Hard delete device; events referencing it will cascade if configured
-    await database.query(
-      `DELETE FROM devices WHERE device_id = $1 AND user_id = $2`,
+    await database.pool.query(
+      `DELETE FROM user_devices WHERE device_id = $1::uuid AND user_id = $2`,
       [deviceId, userId]
     );
 
@@ -247,9 +249,9 @@ router.get('/presence', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    const result = await database.query(
+    const result = await database.pool.query(
       `SELECT device_id, device_name, last_seen
-       FROM devices
+       FROM user_devices
        WHERE user_id = $1
        ORDER BY last_seen DESC`,
       [userId]

@@ -476,6 +476,21 @@ export function createWebSocketGateway(
         await deleteSession(redis, sessionState.deviceId);
         decrementConnection(sessionState.userId, sessionState.deviceId);
         await updatePresence(redis.client, sessionState.deviceId, false);
+
+        // Persist offline status in DB (eventual consistency)
+        try {
+          await db.pool.query(
+            `UPDATE user_devices
+             SET is_online = FALSE, last_seen = NOW()
+             WHERE device_id = $1::uuid`,
+            [sessionState.deviceId]
+          );
+        } catch (error) {
+          logger.warn('Failed to update offline status in DB', {
+            userId: sessionState.userId.substring(0, 16) + '...',
+            deviceId: sessionState.deviceId,
+          }, error instanceof Error ? error : new Error(String(error)));
+        }
         
         // Broadcast device offline to other devices (presence update)
         try {
@@ -697,9 +712,9 @@ async function handleAck(
 ): Promise<void> {
   // Update last_ack_device_seq
   await db.pool.query(
-    `UPDATE devices 
+    `UPDATE user_devices 
      SET last_ack_device_seq = $1, last_seen = NOW()
-     WHERE device_id = $2`,
+     WHERE device_id = $2::uuid`,
     [ack.device_seq, sessionState.deviceId]
   );
 

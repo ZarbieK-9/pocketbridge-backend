@@ -130,11 +130,33 @@ async function initSchema(pool: pg.Pool): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       user_id TEXT PRIMARY KEY, -- Ed25519 public key (hex)
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      last_activity TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 
-  // Devices table
+  // New multi-device table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_devices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      device_id UUID NOT NULL UNIQUE, -- UUIDv4 from client
+      device_name TEXT,
+      device_type TEXT, -- 'mobile', 'desktop', 'web'
+      device_os TEXT,
+      is_online BOOLEAN NOT NULL DEFAULT FALSE,
+      last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+      ip_address INET,
+      user_agent TEXT,
+      public_key_hex TEXT,
+      registered_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      last_ack_device_seq BIGINT NOT NULL DEFAULT 0,
+      CONSTRAINT valid_device_name CHECK (length(device_name) <= 50)
+    )
+  `);
+
+  // Backward-compatible legacy devices table (kept for older data)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS devices (
       device_id TEXT PRIMARY KEY, -- UUIDv4
@@ -246,6 +268,15 @@ async function initSchema(pool: pg.Pool): Promise<void> {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_devices_user_id 
     ON devices(user_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_user_devices_user_id 
+    ON user_devices(user_id)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_user_devices_last_seen 
+    ON user_devices(last_seen DESC)
   `);
 
   logger.info('Database schema initialized');

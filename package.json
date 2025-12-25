@@ -11,7 +11,9 @@
     "migrate": "tsx src/db/migrate.ts",
     "migrate:create": "tsx src/db/migrate.ts create",
     "lint": "eslint src --ext .ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@noble/ed25519": "^3.0.0",
@@ -39,6 +41,9 @@
     "@types/uuid": "^10.0.0",
     "@types/ws": "^8.5.10",
     "tsx": "^4.7.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^1.5.0",
+    "supertest": "^6.3.4",
+    "@types/supertest": "^2.0.16"
   }
 }
