@@ -122,7 +122,16 @@ export async function signEd25519(privateKeyHex: string, data: Buffer | string):
  * Verify Ed25519 signature (hex format)
  */
 export async function verifyEd25519(publicKeyHex: string, data: Buffer | string, signatureHex: string): Promise<boolean> {
-  const dataBytes = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
+  // Convert data to Uint8Array - handle Buffer explicitly
+  let dataBytes: Uint8Array;
+  if (typeof data === 'string') {
+    dataBytes = new TextEncoder().encode(data);
+  } else if (Buffer.isBuffer(data)) {
+    // Convert Buffer to Uint8Array explicitly
+    dataBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  } else {
+    dataBytes = new Uint8Array(data);
+  }
   const signatureBytes = new Uint8Array(Buffer.from(signatureHex, 'hex'));
 
   try {
