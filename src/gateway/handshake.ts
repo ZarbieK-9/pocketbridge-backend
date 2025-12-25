@@ -37,8 +37,23 @@ interface HandshakeState {
   sessionKeys?: ReturnType<typeof deriveSessionKeys>;
 }
 
+
 // Store handshake state per WebSocket connection
 const handshakeStates = new WeakMap<WebSocket, HandshakeState>();
+
+// Helper to reset handshake state on error (must be top-level for all usages)
+function resetHandshakeStateOnError(ws: WebSocket, reason: string) {
+  handshakeStates.delete(ws);
+  logger.info('Handshake state reset due to error', { reason, wsReadyState: ws.readyState });
+}
+
+// Attach WebSocket close handler to reset handshake state
+export function attachHandshakeCleanup(ws: WebSocket) {
+  ws.on('close', () => {
+    handshakeStates.delete(ws);
+    logger.info('WebSocket closed: handshake state reset', { wsReadyState: ws.readyState });
+  });
+}
 
 interface HandshakeResult {
   success: boolean;
@@ -58,6 +73,11 @@ export async function handleHandshake(
 ): Promise<HandshakeResult> {
   // Get or create handshake state
   let state = handshakeStates.get(ws);
+  // Ensure cleanup is attached (idempotent)
+  if (!(ws as any)._handshakeCleanupAttached) {
+    attachHandshakeCleanup(ws);
+    (ws as any)._handshakeCleanupAttached = true;
+  }
   if (!state) {
     logger.warn('No handshake state found, creating new state with step=client_hello', {
       wsReadyState: ws.readyState,
@@ -73,9 +93,11 @@ export async function handleHandshake(
     });
   }
 
+
   // Validate message structure
   if (typeof message !== 'object' || message === null) {
     logger.warn('Invalid message format in handshake', { message });
+    resetHandshakeStateOnError(ws, 'invalid_message_format');
     return { success: false, error: 'Invalid message format' };
   }
 
@@ -109,6 +131,7 @@ export async function handleHandshake(
     stateKeys: Object.keys(state),
   });
 
+  resetHandshakeStateOnError(ws, 'invalid_handshake_step');
   return { success: false, error: `Invalid handshake step: expected ${msg.type === 'client_auth' ? 'server_hello' : 'client_hello'}, got ${state.step}` };
 }
 
@@ -141,6 +164,7 @@ async function handleClientHello(
         expected_length: 64,
         isHex: message.nonce_c ? /^[0-9a-f]+$/i.test(message.nonce_c) : false,
       });
+      resetHandshakeStateOnError(ws, 'invalid_nonce_format');
       return { success: false, error: 'Invalid nonce format' };
     }
 
@@ -234,6 +258,7 @@ async function handleClientHello(
       logger.info('handleClientHello: server_hello sent successfully');
     } catch (sendError) {
       logger.error('handleClientHello: Failed to send server_hello', {}, sendError instanceof Error ? sendError : new Error(String(sendError)));
+      resetHandshakeStateOnError(ws, 'failed_to_send_server_hello');
       return { success: false, error: `Failed to send server_hello: ${sendError instanceof Error ? sendError.message : String(sendError)}` };
     }
 
@@ -296,6 +321,7 @@ async function handleClientAuth(
   // Verify signature using hex format (user_id is Ed25519 public key in hex)
   const publicKeyHex = message.user_id;
   if (publicKeyHex.length !== 64) { // 32 bytes = 64 hex chars
+    resetHandshakeStateOnError(ws, 'invalid_public_key_length');
     return { success: false, error: 'Invalid public key length' };
   }
 
@@ -314,6 +340,7 @@ async function handleClientAuth(
       signatureDataHex: Buffer.from(signatureData).toString('hex').substring(0, 32) + '...',
       clientSignatureHex: message.client_signature.substring(0, 32) + '...',
     });
+    resetHandshakeStateOnError(ws, 'invalid_client_signature');
     return { success: false, error: 'Invalid client signature' };
   }
 
