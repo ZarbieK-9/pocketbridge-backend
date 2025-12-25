@@ -44,14 +44,12 @@ const handshakeStates = new WeakMap<WebSocket, HandshakeState>();
 // Helper to reset handshake state on error (must be top-level for all usages)
 function resetHandshakeStateOnError(ws: WebSocket, reason: string) {
   handshakeStates.delete(ws);
-  logger.info('Handshake state reset due to error', { reason, wsReadyState: ws.readyState });
 }
 
 // Attach WebSocket close handler to reset handshake state
 export function attachHandshakeCleanup(ws: WebSocket) {
   ws.on('close', () => {
     handshakeStates.delete(ws);
-    logger.info('WebSocket closed: handshake state reset', { wsReadyState: ws.readyState });
   });
 }
 
@@ -93,22 +91,13 @@ export async function handleHandshake(
 
   const msg = message as Record<string, unknown>;
 
-  logger.info(`Handshake state check: messageType=${msg.type}, currentStep=${state.step}, expectedStepForClientHello=${state.step === 'client_hello'}, expectedStepForClientAuth=${state.step === 'server_hello'}`);
-
   // Handle Client Hello
   if (msg.type === 'client_hello' && state.step === 'client_hello') {
-    logger.info('Processing client_hello');
     return handleClientHello(msg as unknown as ClientHello, ws, state, serverIdentity);
   }
 
   // Handle Client Auth
   if (msg.type === 'client_auth' && state.step === 'server_hello') {
-    logger.info('Processing client_auth', {
-      userId: (msg as any).user_id?.substring(0, 16) + '...',
-      deviceId: (msg as any).device_id,
-      hasNonceC2: !!(msg as any).nonce_c2,
-      hasClientSignature: !!(msg as any).client_signature,
-    });
     return handleClientAuth(msg as unknown as ClientAuth, ws, state, db, serverIdentity);
   }
 
@@ -135,71 +124,36 @@ async function handleClientHello(
   serverIdentity: ServerIdentityKeypair
 ): Promise<HandshakeResult> {
   try {
-    logger.info('handleClientHello: Starting', {
-      hasNonceC: !!message.nonce_c,
-      nonceC: message.nonce_c,
-      nonceCLength: message.nonce_c?.length,
-      nonceCType: typeof message.nonce_c,
-      hasClientEphemeralPub: !!message.client_ephemeral_pub,
-      serverIdentityPubKeyLength: serverIdentity.publicKeyHex?.length || 0,
-      serverIdentityHasPrivateKey: !!(serverIdentity.privateKeyHex || serverIdentity.privateKey),
-    });
-
-    // Validate nonce - add detailed logging
+    // Validate nonce
     if (!validateNonce(message.nonce_c)) {
-      logger.warn('handleClientHello: Invalid nonce format', { 
-        nonce_c: message.nonce_c,
-        nonce_c_type: typeof message.nonce_c,
-        nonce_c_length: message.nonce_c?.length,
-        expected_length: 64,
-        isHex: message.nonce_c ? /^[0-9a-f]+$/i.test(message.nonce_c) : false,
-      });
       resetHandshakeStateOnError(ws, 'invalid_nonce_format');
       return { success: false, error: 'Invalid nonce format' };
     }
 
     // Generate server ephemeral keypair
-    logger.info('handleClientHello: Generating server ephemeral keypair');
     const serverEphemeralKeypair = generateECDHKeypair();
     const nonceS = generateNonce();
-    logger.info('handleClientHello: Server ephemeral keypair generated', {
-      publicKeyLength: serverEphemeralKeypair.publicKey.length,
-    });
 
     // Compute shared secret
-    logger.info('handleClientHello: Computing shared secret', {
-      clientEphemeralPubLength: message.client_ephemeral_pub?.length,
-      clientEphemeralPubPrefix: message.client_ephemeral_pub?.substring(0, 4),
-      expectedLength: 130, // 65 bytes = 130 hex chars for P-256 uncompressed
-    });
     const sharedSecret = computeECDHSecret(
       message.client_ephemeral_pub,
       serverEphemeralKeypair.privateKey
     );
-    logger.info('handleClientHello: Shared secret computed', {
-      sharedSecretLength: sharedSecret.length,
-    });
 
     // Derive session keys
-    logger.info('handleClientHello: Deriving session keys');
     const sessionKeys = deriveSessionKeys(
       sharedSecret,
       message.client_ephemeral_pub,
       serverEphemeralKeypair.publicKey
     );
-    logger.info('handleClientHello: Session keys derived');
 
     // Sign: SHA256(server_identity_pub || server_ephemeral_pub || nonce_c || nonce_s)
-    logger.info('handleClientHello: Preparing signature data');
     const signatureData = hashForSignature(
       serverIdentity.publicKeyHex,
       serverEphemeralKeypair.publicKey,
       message.nonce_c,
       nonceS
     );
-    logger.info('handleClientHello: Signature data hashed', {
-      signatureDataLength: signatureData.length,
-    });
 
     // Use privateKeyHex if available, otherwise use privateKey (assuming hex format)
     const privateKeyHex = serverIdentity.privateKeyHex || serverIdentity.privateKey;
@@ -208,13 +162,7 @@ async function handleClientHello(
       return { success: false, error: 'Server private key not configured' };
     }
     
-    logger.info('handleClientHello: Signing with server identity key', {
-      privateKeyLength: privateKeyHex.length,
-    });
     const serverSignature = await signEd25519(privateKeyHex, signatureData);
-    logger.info('handleClientHello: Signature created', {
-      signatureLength: serverSignature.length,
-    });
 
     // Update state
     state.step = 'server_hello';
@@ -224,7 +172,6 @@ async function handleClientHello(
     state.nonceS = nonceS;
     state.sharedSecret = sharedSecret;
     state.sessionKeys = sessionKeys;
-    logger.info('handleClientHello: State updated to server_hello');
 
     // Send Server Hello
     const serverHello: ServerHello = {
@@ -234,25 +181,18 @@ async function handleClientHello(
       server_signature: serverSignature,
       nonce_s: nonceS,
     };
-
-    logger.info('handleClientHello: Sending server_hello', {
-      wsReadyState: ws.readyState,
-      serverHelloType: serverHello.type,
-    });
     
     try {
       ws.send(JSON.stringify({
         type: 'server_hello',
         payload: serverHello,
       }));
-      logger.info('handleClientHello: server_hello sent successfully');
     } catch (sendError) {
       logger.error('handleClientHello: Failed to send server_hello', {}, sendError instanceof Error ? sendError : new Error(String(sendError)));
       resetHandshakeStateOnError(ws, 'failed_to_send_server_hello');
       return { success: false, error: `Failed to send server_hello: ${sendError instanceof Error ? sendError.message : String(sendError)}` };
     }
 
-    logger.info('handleClientHello: Success, returning success: true');
     return { success: true };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -378,15 +318,8 @@ async function handleClientAuth(
     payload: sessionEstablished,
   };
   
-  logger.info('Sending session_established message', {
-    deviceId: message.device_id,
-    wsReadyState: ws.readyState,
-    message: JSON.stringify(sessionEstablishedMessage).substring(0, 200),
-  });
-  
   try {
     ws.send(JSON.stringify(sessionEstablishedMessage));
-    logger.info('session_established message sent successfully');
   } catch (error) {
     logger.error('Failed to send session_established message', {}, error instanceof Error ? error : new Error(String(error)));
     throw error;

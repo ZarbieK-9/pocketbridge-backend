@@ -281,7 +281,7 @@ export function validateNonce(nonce: string): boolean {
  */
 export function hashForSignature(...parts: (Buffer | Uint8Array | string | object)[]): Buffer {
   const hash = crypto.createHash('sha256');
-  parts.forEach((part, idx) => {
+  parts.forEach((part) => {
     let str: string;
     if (Buffer.isBuffer(part) || part instanceof Uint8Array) {
       // Convert Buffer/Uint8Array to hex string
@@ -289,10 +289,6 @@ export function hashForSignature(...parts: (Buffer | Uint8Array | string | objec
     } else {
       str = String(part);
     }
-    // Log type and value (first 8/last 8 chars)
-    const preview = str.length > 16 ? `${str.slice(0,8)}...${str.slice(-8)}` : str;
-    // eslint-disable-next-line no-console
-    console.log(`[HASH PART ${idx}] type: ${typeof part}, value: ${preview}`);
     hash.update(Buffer.from(str, 'utf8'));
   });
   return hash.digest();
