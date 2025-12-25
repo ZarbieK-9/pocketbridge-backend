@@ -299,7 +299,7 @@ async function handleClientAuth(
     return { success: false, error: 'Invalid public key length' };
   }
 
-  // Verify signature using @noble/ed25519 (hex format)
+  // Verify signature using tweetnacl-compatible hex format
   logger.info(`Verifying client signature - PublicKey: ${publicKeyHex.substring(0, 16)}..., SignatureDataHash: ${signatureDataHex.substring(0, 32)}..., ClientSignature: ${message.client_signature.substring(0, 32)}...`);
 
   const isValid = await verifyEd25519(

@@ -12,33 +12,10 @@
  */
 
 import crypto from 'crypto';
-import * as ed25519 from '@noble/ed25519';
+import * as nacl from 'tweetnacl';
 import { logger } from '../utils/logger.js';
 
-// Set up SHA-512 hash function for @noble/ed25519 v3 in Node.js
-// @noble/ed25519 v3 uses `etc.sha512Sync` and `etc.sha512Async`
-const sha512 = (m: Uint8Array): Uint8Array => {
-  return crypto.createHash('sha512').update(m).digest();
-};
-
-const sha512Async = async (m: Uint8Array): Promise<Uint8Array> => {
-  return sha512(m);
-};
-
-// Set the hash functions on the exported `etc` object
-// @noble/ed25519 v2.3.0 exports `etc` which contains sha512Sync and sha512Async
-try {
-  const ed25519Any = ed25519 as any;
-  // The etc object is exported in some versions; set sha512 if available
-  if (ed25519Any.etc) {
-    ed25519Any.etc.sha512Sync = sha512;
-    ed25519Any.etc.sha512Async = sha512Async;
-  } else {
-    logger.warn('ed25519.etc not available; skipping sha512 hook setup (using Node crypto for Ed25519 ops)');
-  }
-} catch (e) {
-  logger.warn('Could not set up SHA-512 for ed25519; continuing with Node crypto', e instanceof Error ? e : new Error(String(e)));
-}
+// Using tweetnacl for Ed25519 across backend
 
 export interface ServerIdentityKeypair {
   publicKey: string; // Hex format (for compatibility)
@@ -66,9 +43,10 @@ export interface SessionKeys {
  */
 export async function generateServerIdentityKeypair(): Promise<ServerIdentityKeypair> {
   try {
-    // Use randomSecretKey (32-byte seed) compatible with v3
-    const privateKey = ed25519.utils.randomSecretKey();
-    const publicKey = await ed25519.getPublicKey(privateKey);
+    // Generate 32-byte seed and derive Ed25519 keypair via tweetnacl
+    const privateKey = nacl.randomBytes(32);
+    const kp = nacl.sign.keyPair.fromSeed(privateKey);
+    const publicKey = kp.publicKey;
     
     const privateKeyHex = Buffer.from(privateKey).toString('hex');
     const publicKeyHex = Buffer.from(publicKey).toString('hex');
@@ -134,8 +112,9 @@ export async function signEd25519(privateKeyHex: string, data: Buffer | string):
   if (!privateKeyBytes || privateKeyBytes.length !== 32) {
     throw new Error('Failed to extract valid 32-byte Ed25519 private key');
   }
-  
-  const signature = await ed25519.sign(dataBytes, privateKeyBytes);
+  // tweetnacl requires secretKey (64 bytes); derive from seed
+  const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+  const signature = nacl.sign.detached(new Uint8Array(dataBytes), kp.secretKey);
   return Buffer.from(signature).toString('hex');
 }
 
@@ -143,41 +122,30 @@ export async function signEd25519(privateKeyHex: string, data: Buffer | string):
  * Verify Ed25519 signature (hex format)
  */
 export async function verifyEd25519(publicKeyHex: string, data: Buffer | string, signatureHex: string): Promise<boolean> {
-  const dataBytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
-  const signatureBytes = Buffer.from(signatureHex, 'hex');
+  const dataBytes = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
+  const signatureBytes = new Uint8Array(Buffer.from(signatureHex, 'hex'));
 
   try {
-    // If the publicKeyHex appears to be raw 32-byte hex, wrap it in SPKI DER.
-    // SPKI DER prefix for Ed25519 public key: 302a300506032b6570032100
-    let publicKeyDer: Buffer;
+    let publicKeyBytes: Uint8Array;
+    // Raw 32-byte hex
     if (publicKeyHex.length === 64) {
-      const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
-      const rawPub = Buffer.from(publicKeyHex, 'hex');
-      publicKeyDer = Buffer.concat([spkiPrefix, rawPub]);
+      publicKeyBytes = new Uint8Array(Buffer.from(publicKeyHex, 'hex'));
     } else {
-      // Assume already DER-encoded (like SERVER_PUBLIC_KEY_HEX format)
-      publicKeyDer = Buffer.from(publicKeyHex, 'hex');
-    }
-
-    const publicKeyObject = crypto.createPublicKey({ key: publicKeyDer, format: 'der', type: 'spki' });
-    // For Ed25519, algorithm must be null
-    return crypto.verify(null, dataBytes, publicKeyObject, signatureBytes);
-  } catch (e) {
-    logger.error('Ed25519 verify via Node crypto failed, falling back to noble', {
-      error: e instanceof Error ? e.message : String(e),
-      pubKeyLen: publicKeyHex.length,
-    });
-    // Fallback to noble (requires sha512 configured); may fail in some environments
-    try {
-      const publicKeyBytes = Buffer.from(publicKeyHex.length === 64 ? publicKeyHex : '', 'hex');
-      if (publicKeyBytes.length !== 32) {
-        throw new Error('Fallback noble verify requires raw 32-byte public key');
+      // Try SPKI DER prefix: 302a300506032b6570032100
+      const prefix = '302a300506032b6570032100';
+      if (publicKeyHex.startsWith(prefix) && publicKeyHex.length === prefix.length + 64) {
+        publicKeyBytes = new Uint8Array(Buffer.from(publicKeyHex.slice(prefix.length), 'hex'));
+      } else {
+        // Fallback to Node crypto verify for unknown formats
+        const publicKeyDer = Buffer.from(publicKeyHex, 'hex');
+        const publicKeyObject = crypto.createPublicKey({ key: publicKeyDer, format: 'der', type: 'spki' });
+        return crypto.verify(null, Buffer.from(dataBytes), publicKeyObject, Buffer.from(signatureBytes));
       }
-      return await ed25519.verify(signatureBytes, dataBytes, publicKeyBytes);
-    } catch (e2) {
-      logger.error('Ed25519 noble verify failed', { error: e2 instanceof Error ? e2.message : String(e2) });
-      return false;
     }
+    return nacl.sign.detached.verify(dataBytes, signatureBytes, publicKeyBytes);
+  } catch (e) {
+    logger.error('Ed25519 verify failed', { error: e instanceof Error ? e.message : String(e) });
+    return false;
   }
 }
 
