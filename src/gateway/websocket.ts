@@ -229,6 +229,9 @@ export function createWebSocketGateway(
 
     // Handle incoming messages - set up immediately
     ws.on('message', async (data: Buffer) => {
+      // Declare message outside try block so it's accessible in catch
+      let message: any = null;
+      
       try {
         // Check buffer overflow protection
         const currentBuffered = bufferedMessageCount.get(ws) || 0;
@@ -309,7 +312,7 @@ export function createWebSocketGateway(
           throw new Error('Message too large');
         }
 
-        let message: any;
+        // Parse message (message is declared at function scope for error handling)
         try {
           message = JSON.parse(data.toString('utf8'));
         } catch (parseError) {
@@ -674,18 +677,32 @@ export function createWebSocketGateway(
         const err = error instanceof Error ? error : new Error(String(error));
         const isProduction = process.env.NODE_ENV === 'production';
 
+        // Extract message context for better debugging
+        let messageContext: Record<string, unknown> = {
+          clientId,
+          message: err.message,
+          name: err.name,
+          hasSessionState: !!sessionState,
+          handshakeComplete,
+          messageType: message?.type,
+        };
+
+        // Add stack trace (always log it, but don't expose to client)
+        if (err.stack) {
+          messageContext.stack = err.stack;
+        }
+
         // Log error with full details (for debugging)
-        logger.error(
-          'WebSocket message error',
-          {
-            clientId,
-            message: err.message,
-            name: err.name,
-            // Only include stack trace in non-production for debugging
-            ...(isProduction ? {} : { stack: err.stack }),
-          },
-          err
-        );
+        const errorContext = {
+          ...messageContext,
+          errorType: err.constructor.name,
+        };
+        
+        logger.error(errorContext, 'WebSocket message error');
+        console.error('[ERROR] WebSocket message error:', {
+          ...errorContext,
+          fullError: error,
+        });
 
         // Sanitize error message for client (don't expose internal details)
         let clientErrorMessage: string;
@@ -700,8 +717,17 @@ export function createWebSocketGateway(
           clientErrorMessage = err.message || 'Internal error';
         }
 
-        // Close connection with sanitized error message
-        ws.close(1011, clientErrorMessage);
+        // Only close connection for critical errors
+        // Some errors might be recoverable (e.g., invalid message format)
+        const shouldClose = !(err instanceof ValidationError && err.message.includes('format'));
+        
+        if (shouldClose) {
+          // Close connection with sanitized error message
+          ws.close(1011, clientErrorMessage);
+        } else {
+          // Log warning but don't close - allow client to retry
+          logger.warn('Non-critical WebSocket error, keeping connection open', errorContext);
+        }
       } finally {
         // Always decrement buffered message count, even on error
         const currentBuffered = bufferedMessageCount.get(ws) || 0;
