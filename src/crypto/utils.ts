@@ -12,7 +12,8 @@
  */
 
 import crypto from 'crypto';
-import * as nacl from 'tweetnacl';
+// tweetnacl uses default export in ESM
+import nacl from 'tweetnacl';
 import { logger } from '../utils/logger.js';
 
 // Validate tweetnacl import at module load time
@@ -23,6 +24,7 @@ if (!nacl || !nacl.sign || !nacl.sign.keyPair || !nacl.sign.keyPair.fromSeed) {
     hasNaclSign: !!nacl?.sign,
     hasKeyPair: !!(nacl?.sign && nacl.sign.keyPair),
     naclKeys: nacl ? Object.keys(nacl) : [],
+    naclType: typeof nacl,
   });
   throw new Error(errorMsg);
 }
