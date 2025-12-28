@@ -203,7 +203,7 @@ export function createWebSocketGateway(
     let rateLimitChecked = false;
     let rateLimitAllowed = false;
 
-    // Set handshake timeout (30 seconds)
+    // Set handshake timeout (60 seconds - increased for slower connections)
     const handshakeTimeout = setTimeout(() => {
       const currentTimeout = handshakeTimeouts.get(ws);
       const currentSessionState = (ws as any)._sessionState;
@@ -214,12 +214,16 @@ export function createWebSocketGateway(
         !currentSessionState
       ) {
         auditLog(AuditEventType.HANDSHAKE_TIMEOUT, { clientId });
-        logger.warn('Handshake timeout', { clientId, readyState: ws.readyState });
-        if (ws.readyState === WebSocket.OPEN) {
+        logger.warn('Handshake timeout', { 
+          clientId, 
+          readyState: ws.readyState,
+          timeoutMs: 60000,
+        });
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
           ws.close(1008, 'Handshake timeout');
         }
       }
-    }, 30000);
+    }, 60000); // Increased from 30s to 60s for slower connections
     handshakeTimeouts.set(ws, handshakeTimeout);
 
     logger.debug('Message handler attached, waiting for client_hello', {
@@ -1192,7 +1196,11 @@ async function handleReplayRequest(
       page_size: 0,
       ...(totalEvents !== undefined && { total_events: totalEvents }),
     };
-    ws.send(JSON.stringify(emptyResponse));
+    // Send wrapped in WSMessage format for consistency
+    ws.send(JSON.stringify({
+      type: 'replay_response',
+      payload: emptyResponse,
+    }));
     return;
   }
 
@@ -1214,7 +1222,11 @@ async function handleReplayRequest(
     ...(totalEvents !== undefined && { total_events: totalEvents }),
   };
 
-  ws.send(JSON.stringify(response));
+  // Send wrapped in WSMessage format for consistency
+  ws.send(JSON.stringify({
+    type: 'replay_response',
+    payload: response,
+  }));
 }
 
 /**

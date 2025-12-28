@@ -56,12 +56,19 @@ export async function cleanupOldEvents(
 
     return deletedCount;
   } catch (error) {
-    logger.error(
-      'Failed to cleanup old events',
-      {},
-      error instanceof Error ? error : new Error(String(error))
-    );
-    throw error;
+    const errorContext = {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      retentionDays,
+      cutoffDate: cutoffDate.toISOString(),
+    };
+    logger.error(errorContext, 'Failed to cleanup old events');
+    console.error('[ERROR] Failed to cleanup old events:', {
+      ...errorContext,
+      fullError: error,
+    });
+    // Don't throw - event cleanup failure shouldn't stop other cleanup tasks
+    return 0;
   }
 }
 
@@ -85,7 +92,7 @@ export async function cleanupInactiveDevices(
        AND last_seen < $1
        AND NOT EXISTS (
          SELECT 1 FROM events 
-         WHERE events.device_id = user_devices.device_id::text
+         WHERE events.device_id = user_devices.device_id
          AND events.created_at > $1
        )
        RETURNING device_id`,
@@ -107,12 +114,19 @@ export async function cleanupInactiveDevices(
 
     return deletedCount;
   } catch (error) {
-    logger.error(
-      'Failed to cleanup inactive devices',
-      {},
-      error instanceof Error ? error : new Error(String(error))
-    );
-    throw error;
+    const errorContext = {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      inactiveDays,
+      cutoffDate: cutoffDate.toISOString(),
+    };
+    logger.error(errorContext, 'Failed to cleanup inactive devices');
+    console.error('[ERROR] Failed to cleanup inactive devices:', {
+      ...errorContext,
+      fullError: error,
+    });
+    // Don't throw - device cleanup failure shouldn't stop other cleanup tasks
+    return 0;
   }
 }
 
@@ -149,12 +163,19 @@ export async function cleanupOldSessions(
 
     return deletedCount;
   } catch (error) {
-    logger.error(
-      'Failed to cleanup old sessions',
-      {},
-      error instanceof Error ? error : new Error(String(error))
-    );
-    throw error;
+    const errorContext = {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      retentionDays,
+      cutoffDate: cutoffDate.toISOString(),
+    };
+    logger.error(errorContext, 'Failed to cleanup old sessions');
+    console.error('[ERROR] Failed to cleanup old sessions:', {
+      ...errorContext,
+      fullError: error,
+    });
+    // Don't throw - session cleanup is not critical, continue with other cleanup tasks
+    return 0;
   }
 }
 
@@ -206,21 +227,29 @@ export function startDataRetentionJob(
 
   // Run immediately on start
   runDataRetentionCleanup(db).catch(error => {
-    logger.error(
-      'Data retention job error on startup',
-      {},
-      error instanceof Error ? error : new Error(String(error))
-    );
+    const errorContext = {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    };
+    logger.error(errorContext, 'Data retention job error on startup');
+    console.error('[ERROR] Data retention job error on startup:', {
+      ...errorContext,
+      fullError: error,
+    });
   });
 
   // Then run periodically
   setInterval(() => {
     runDataRetentionCleanup(db).catch(error => {
-      logger.error(
-        'Data retention job error',
-        {},
-        error instanceof Error ? error : new Error(String(error))
-      );
+      const errorContext = {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      };
+      logger.error(errorContext, 'Data retention job error');
+      console.error('[ERROR] Data retention job error:', {
+        ...errorContext,
+        fullError: error,
+      });
     });
   }, intervalMs);
 }
