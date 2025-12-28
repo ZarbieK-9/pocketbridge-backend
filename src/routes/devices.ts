@@ -62,11 +62,11 @@ router.get('/devices', async (req: Request, res: Response) => {
         [userId]
       );
     } catch (activityError: any) {
-      // If last_activity column doesn't exist, try without it
+      // If last_activity column doesn't exist, try without it and set created_at
       if (activityError?.code === '42703') {
         logger.warn('last_activity column not found, using fallback query', { userId });
         await database.pool.query(
-          `INSERT INTO users (user_id) VALUES ($1)
+          `INSERT INTO users (user_id, created_at) VALUES ($1, NOW())
            ON CONFLICT (user_id) DO NOTHING`,
           [userId]
         );
