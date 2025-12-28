@@ -15,6 +15,18 @@ import crypto from 'crypto';
 import * as nacl from 'tweetnacl';
 import { logger } from '../utils/logger.js';
 
+// Validate tweetnacl import at module load time
+if (!nacl || !nacl.sign || !nacl.sign.keyPair || !nacl.sign.keyPair.fromSeed) {
+  const errorMsg = 'tweetnacl import failed or API not available. Check tweetnacl installation.';
+  console.error('[CRITICAL]', errorMsg, {
+    hasNacl: !!nacl,
+    hasNaclSign: !!nacl?.sign,
+    hasKeyPair: !!(nacl?.sign && nacl.sign.keyPair),
+    naclKeys: nacl ? Object.keys(nacl) : [],
+  });
+  throw new Error(errorMsg);
+}
+
 // Using tweetnacl for Ed25519 across backend
 
 export interface ServerIdentityKeypair {
@@ -120,8 +132,24 @@ export async function signEd25519(privateKeyHex: string, data: Buffer | string):
   if (!privateKeyBytes || privateKeyBytes.length !== 32) {
     throw new Error('Failed to extract valid 32-byte Ed25519 private key');
   }
+  
+  // Validate nacl.sign exists
+  if (!nacl.sign || !nacl.sign.keyPair || !nacl.sign.keyPair.fromSeed) {
+    const errorMsg = 'tweetnacl sign API not available. Check tweetnacl import and version.';
+    logger.error(errorMsg, {
+      hasNacl: !!nacl,
+      hasNaclSign: !!nacl.sign,
+      hasKeyPair: !!(nacl.sign && nacl.sign.keyPair),
+      hasFromSeed: !!(nacl.sign && nacl.sign.keyPair && nacl.sign.keyPair.fromSeed),
+    });
+    throw new Error(errorMsg);
+  }
+  
   // tweetnacl requires secretKey (64 bytes); derive from seed
   const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+  if (!kp || !kp.secretKey) {
+    throw new Error('Failed to generate keypair from seed');
+  }
   const signature = nacl.sign.detached(new Uint8Array(dataBytes), kp.secretKey);
   return Buffer.from(signature).toString('hex');
 }
