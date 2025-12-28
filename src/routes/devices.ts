@@ -53,10 +53,12 @@ router.get('/devices', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    // Update user activity
-    await database.pool.query(`UPDATE users SET last_activity = NOW() WHERE user_id = $1`, [
-      userId,
-    ]);
+    // Update user activity (create user if doesn't exist)
+    await database.pool.query(
+      `INSERT INTO users (user_id, last_activity) VALUES ($1, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()`,
+      [userId]
+    );
 
     // Get all devices for user (from devices table)
     const result = await database.pool.query(
@@ -69,15 +71,32 @@ router.get('/devices', async (req: Request, res: Response) => {
       [userId]
     );
 
-    const devices: DeviceInfo[] = result.rows.map((row: any) => ({
-      device_id: row.device_id,
-      device_name: row.device_name,
-      device_type: row.device_type,
-      device_os: row.device_os,
-      is_online: sessionsMap ? sessionsMap.has(row.device_id) : false,
-      last_seen: new Date(row.last_seen).getTime(),
-      ip_address: row.ip_address || undefined,
-    }));
+    const devices: DeviceInfo[] = result.rows.map((row: any) => {
+      // Convert device_id to string for sessionsMap lookup (sessionsMap uses string keys)
+      const deviceIdStr = typeof row.device_id === 'string' 
+        ? row.device_id 
+        : row.device_id?.toString() || String(row.device_id);
+      
+      // Safely convert last_seen to timestamp
+      let lastSeenTimestamp: number;
+      try {
+        lastSeenTimestamp = row.last_seen 
+          ? new Date(row.last_seen).getTime() 
+          : Date.now();
+      } catch {
+        lastSeenTimestamp = Date.now();
+      }
+      
+      return {
+        device_id: deviceIdStr,
+        device_name: row.device_name || null,
+        device_type: row.device_type || null,
+        device_os: row.device_os || null,
+        is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
+        last_seen: lastSeenTimestamp,
+        ip_address: row.ip_address || undefined,
+      };
+    });
 
     // Handle empty state
     const is_empty = devices.length === 0;
@@ -88,12 +107,21 @@ router.get('/devices', async (req: Request, res: Response) => {
       message: is_empty ? 'No devices connected. Connect a device to start syncing.' : undefined,
     });
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
     logger.error(
       'Failed to get devices',
-      {},
+      {
+        userId: (req as any).userId,
+        error: errorMessage,
+        stack: errorStack,
+      },
       error instanceof Error ? error : new Error(String(error))
     );
-    res.status(500).json({ error: 'Failed to get devices' });
+    res.status(500).json({ 
+      error: 'Failed to get devices',
+      message: process.env.NODE_ENV === 'development' ? errorMessage : undefined,
+    });
   }
 });
 
@@ -114,10 +142,12 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    // Update user activity
-    await database.pool.query(`UPDATE users SET last_activity = NOW() WHERE user_id = $1`, [
-      userId,
-    ]);
+    // Update user activity (create user if doesn't exist)
+    await database.pool.query(
+      `INSERT INTO users (user_id, last_activity) VALUES ($1, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()`,
+      [userId]
+    );
 
     const result = await database.pool.query(
       `SELECT * FROM user_devices
@@ -178,10 +208,12 @@ router.post('/devices/:deviceId/rename', async (req: Request, res: Response) => 
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    // Update user activity
-    await database.pool.query(`UPDATE users SET last_activity = NOW() WHERE user_id = $1`, [
-      userId,
-    ]);
+    // Update user activity (create user if doesn't exist)
+    await database.pool.query(
+      `INSERT INTO users (user_id, last_activity) VALUES ($1, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()`,
+      [userId]
+    );
 
     // Sanitize device name (remove invalid UTF-8, truncate to 50 chars)
     const sanitizedName = sanitizeDeviceName(device_name, 50);
@@ -263,10 +295,12 @@ router.delete('/devices/:deviceId', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    // Update user activity
-    await database.pool.query(`UPDATE users SET last_activity = NOW() WHERE user_id = $1`, [
-      userId,
-    ]);
+    // Update user activity (create user if doesn't exist)
+    await database.pool.query(
+      `INSERT INTO users (user_id, last_activity) VALUES ($1, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()`,
+      [userId]
+    );
 
     // Verify device belongs to user
     const checkResult = await database.pool.query(
@@ -324,14 +358,12 @@ router.get('/presence', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    // Update user activity
-    await database.pool.query(`UPDATE users SET last_activity = NOW() WHERE user_id = $1`, [
-      userId,
-    ]);
-
-    if (!database) {
-      return res.status(503).json({ error: 'Database not initialized' });
-    }
+    // Update user activity (create user if doesn't exist)
+    await database.pool.query(
+      `INSERT INTO users (user_id, last_activity) VALUES ($1, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()`,
+      [userId]
+    );
 
     const result = await database.pool.query(
       `SELECT device_id, device_name, last_seen

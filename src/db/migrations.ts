@@ -6,7 +6,7 @@
 
 import type { Database } from './postgres.js';
 import { logger } from '../utils/logger.js';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -25,12 +25,41 @@ interface Migration {
  */
 function getMigrations(): Migration[] {
   const migrations: Migration[] = [];
-  const migrationsDir = join(__dirname, '../../migrations');
+  
+  // Try multiple possible paths for migrations directory
+  const possiblePaths = [
+    join(process.cwd(), 'migrations'),              // From backend directory (when running npm script)
+    join(process.cwd(), 'backend/migrations'),      // From workspace root
+    join(__dirname, '../../migrations'),           // From dist/db (compiled)
+    join(__dirname, '../../../migrations'),        // Alternative compiled path
+  ];
+  
+  let migrationsDir: string | null = null;
+  for (const path of possiblePaths) {
+    try {
+      if (existsSync(path) && statSync(path).isDirectory()) {
+        migrationsDir = path;
+        break;
+      }
+    } catch {
+      // Continue to next path
+    }
+  }
+  
+  if (!migrationsDir) {
+    logger.warn('Could not find migrations directory', { 
+      triedPaths: possiblePaths,
+      cwd: process.cwd(),
+      __dirname: __dirname 
+    });
+    return [];
+  }
+  
+  logger.debug('Found migrations directory', { path: migrationsDir });
 
   // Read migration files
   try {
-    const fs = require('fs');
-    const files = fs.readdirSync(migrationsDir).filter((f: string) => f.endsWith('.sql'));
+    const files = readdirSync(migrationsDir).filter((f: string) => f.endsWith('.sql'));
 
     for (const file of files) {
       const match = file.match(/^(\d+)-(.+)\.sql$/);
@@ -99,6 +128,10 @@ async function applyMigration(db: Database, migration: Migration): Promise<void>
     logger.info(`Migration ${migration.version} applied successfully`);
   } catch (error) {
     await client.query('ROLLBACK');
+    logger.error(`Migration ${migration.version} failed`, {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     throw error;
   } finally {
     client.release();

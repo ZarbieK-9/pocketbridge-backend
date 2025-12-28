@@ -41,7 +41,15 @@ async function main() {
     await db.end();
     process.exit(0);
   } catch (error) {
-    logger.error('Migration failed', {}, error instanceof Error ? error : new Error(String(error)));
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    logger.error('Migration failed', { error: errorMessage, stack: errorStack }, error instanceof Error ? error : new Error(String(error)));
+    console.error('\n❌ Migration failed:');
+    console.error(errorMessage);
+    if (errorStack) {
+      console.error('\nStack trace:');
+      console.error(errorStack);
+    }
     process.exit(1);
   }
 }

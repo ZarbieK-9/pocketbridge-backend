@@ -2,6 +2,8 @@
 -- Version: 1
 -- Description: Creates initial database schema
 
+-- UP
+
 -- Users table (stores Ed25519 public keys)
 CREATE TABLE IF NOT EXISTS users (
   user_id TEXT PRIMARY KEY, -- Ed25519 public key (hex)

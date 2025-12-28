@@ -1,6 +1,8 @@
 -- Migration: Add device name uniqueness and device type validation
--- Created: 2024
+-- Version: 3
 -- Description: Enforces unique device names per user and validates device_type enum
+
+-- UP
 
 -- Add unique constraint for device names per user
 -- This ensures a user cannot have multiple devices with the same name
