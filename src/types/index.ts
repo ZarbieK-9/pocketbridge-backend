@@ -55,6 +55,8 @@ export interface ClientAuth {
   device_id: string; // UUIDv4
   client_signature: string; // Ed25519 signature (hex)
   nonce_c2: string; // 32 bytes hex
+  device_name?: string; // Optional device name
+  device_type?: 'mobile' | 'desktop' | 'web'; // Optional device type
 }
 
 export interface SessionEstablished {

@@ -532,13 +532,18 @@ async function handleClientAuth(
     ]);
 
     // Get or create device in multi-schema and get last_ack_device_seq
+    // Include device_name and device_type if provided
     const deviceResult = await db.pool.query(
-      `INSERT INTO user_devices (device_id, user_id, last_ack_device_seq, is_online, last_seen)
-       VALUES ($1::uuid, $2, 0, TRUE, NOW())
+      `INSERT INTO user_devices (device_id, user_id, device_name, device_type, last_ack_device_seq, is_online, last_seen)
+       VALUES ($1::uuid, $2, $3, $4, 0, TRUE, NOW())
        ON CONFLICT (device_id)
-       DO UPDATE SET last_seen = NOW(), is_online = TRUE
+       DO UPDATE SET 
+         last_seen = NOW(), 
+         is_online = TRUE,
+         device_name = COALESCE(EXCLUDED.device_name, user_devices.device_name),
+         device_type = COALESCE(EXCLUDED.device_type, user_devices.device_type)
        RETURNING last_ack_device_seq`,
-      [message.device_id, message.user_id]
+      [message.device_id, message.user_id, message.device_name || null, message.device_type || null]
     );
 
     const lastAckDeviceSeq = deviceResult.rows[0]?.last_ack_device_seq || 0;

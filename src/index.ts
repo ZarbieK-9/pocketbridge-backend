@@ -217,11 +217,15 @@ app.use('/admin', adminRouter);
 
 // API routes with versioning
 // Version can be specified in path (/api/v1/...) or header (X-API-Version: v1)
+// Import user profile router
+import userProfileRouter from './routes/user-profile.js';
+
 app.use('/api/v1/auth', authRouter);
 app.use('/api/v1/pairing', pairingRouter);
 app.use('/api/v1', statusRouter);
 app.use('/api/v1', devicesRouter);
 app.use('/api/v1', userRouter);
+app.use('/api/v1', userProfileRouter);
 
 // Backward compatibility: also support /api/... (defaults to v1)
 app.use('/api/auth', authRouter);
@@ -229,6 +233,7 @@ app.use('/api/pairing', pairingRouter);
 app.use('/api', statusRouter);
 app.use('/api', devicesRouter);
 app.use('/api', userRouter);
+app.use('/api', userProfileRouter);
 
 // 404 handler
 app.use((req, res) => {
