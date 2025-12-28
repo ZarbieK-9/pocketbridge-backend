@@ -336,11 +336,15 @@ async function handleClientHello(
     try {
       ws.send(JSON.stringify(response));
     } catch (sendError) {
-      logger.error(
-        'handleClientHello: Failed to send server_hello',
-        {},
-        sendError instanceof Error ? sendError : new Error(String(sendError))
-      );
+      const errorContext = {
+        error: sendError instanceof Error ? sendError.message : String(sendError),
+        stack: sendError instanceof Error ? sendError.stack : undefined,
+      };
+      logger.error(errorContext, 'handleClientHello: Failed to send server_hello');
+      console.error('[ERROR] handleClientHello: Failed to send server_hello:', {
+        ...errorContext,
+        fullError: sendError,
+      });
       resetHandshakeStateOnError(ws, 'failed_to_send_server_hello');
       return {
         success: false,
@@ -352,19 +356,23 @@ async function handleClientHello(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
-    logger.error(
-      'handleClientHello: Exception occurred',
-      {
-        error: errorMessage,
-        errorType: error instanceof Error ? error.constructor.name : typeof error,
-        stack: errorStack,
-        messageType: message?.type,
-        hasClientEphemeralPub: !!message?.client_ephemeral_pub,
-        hasNonceC: !!message?.nonce_c,
-        serverIdentityConfigured: !!(serverIdentity?.publicKeyHex && serverIdentity?.privateKey),
-      },
-      error instanceof Error ? error : new Error(String(error))
-    );
+    const errorContext = {
+      error: errorMessage,
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+      stack: errorStack,
+      messageType: message?.type,
+      hasClientEphemeralPub: !!message?.client_ephemeral_pub,
+      hasNonceC: !!message?.nonce_c,
+      serverIdentityConfigured: !!(serverIdentity?.publicKeyHex && serverIdentity?.privateKey),
+    };
+    
+    // Log with both logger and console.error to ensure visibility
+    logger.error(errorContext, 'handleClientHello: Exception occurred');
+    console.error('[ERROR] handleClientHello: Exception occurred:', {
+      ...errorContext,
+      fullError: error,
+    });
+    
     resetHandshakeStateOnError(ws, 'handleClientHello_exception');
     return { success: false, error: `handleClientHello failed: ${errorMessage}` };
   }
@@ -556,11 +564,15 @@ async function handleClientAuth(
     try {
       ws.send(JSON.stringify(sessionEstablishedMessage));
     } catch (error) {
-      logger.error(
-        'Failed to send session_established message',
-        {},
-        error instanceof Error ? error : new Error(String(error))
-      );
+      const errorContext = {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      };
+      logger.error(errorContext, 'Failed to send session_established message');
+      console.error('[ERROR] Failed to send session_established message:', {
+        ...errorContext,
+        fullError: error,
+      });
       throw error;
     }
 
@@ -574,19 +586,23 @@ async function handleClientAuth(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
-    logger.error(
-      'handleClientAuth: Exception occurred',
-      {
-        error: errorMessage,
-        errorType: error instanceof Error ? error.constructor.name : typeof error,
-        stack: errorStack,
-        hasUserId: !!message?.user_id,
-        hasDeviceId: !!message?.device_id,
-        hasClientSignature: !!message?.client_signature,
-        stateStep: state?.step,
-      },
-      error instanceof Error ? error : new Error(String(error))
-    );
+    const errorContext = {
+      error: errorMessage,
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+      stack: errorStack,
+      hasUserId: !!message?.user_id,
+      hasDeviceId: !!message?.device_id,
+      hasClientSignature: !!message?.client_signature,
+      stateStep: state?.step,
+    };
+    
+    // Log with both logger and console.error to ensure visibility
+    logger.error(errorContext, 'handleClientAuth: Exception occurred');
+    console.error('[ERROR] handleClientAuth: Exception occurred:', {
+      ...errorContext,
+      fullError: error,
+    });
+    
     resetHandshakeStateOnError(ws, 'handleClientAuth_exception');
     return { success: false, error: `handleClientAuth failed: ${errorMessage}` };
   }

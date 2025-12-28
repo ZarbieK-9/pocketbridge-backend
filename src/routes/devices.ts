@@ -73,14 +73,16 @@ router.get('/devices', async (req: Request, res: Response) => {
         [userId]
       );
     } catch (queryError) {
-      logger.error(
-        'Database query failed in get devices',
-        {
-          userId,
-          error: queryError instanceof Error ? queryError.message : String(queryError),
-        },
-        queryError instanceof Error ? queryError : new Error(String(queryError))
-      );
+      const errorContext = {
+        userId,
+        error: queryError instanceof Error ? queryError.message : String(queryError),
+        stack: queryError instanceof Error ? queryError.stack : undefined,
+      };
+      logger.error(errorContext, 'Database query failed in get devices');
+      console.error('[ERROR] Database query failed in get devices:', {
+        ...errorContext,
+        fullError: queryError,
+      });
       throw queryError;
     }
 
@@ -132,14 +134,16 @@ router.get('/devices', async (req: Request, res: Response) => {
           ip_address: row.ip_address ? String(row.ip_address) : undefined,
         };
       } catch (mapError) {
-        logger.error(
-          'Error mapping device row',
-          {
-            row: JSON.stringify(row).substring(0, 200),
-            error: mapError instanceof Error ? mapError.message : String(mapError),
-          },
-          mapError instanceof Error ? mapError : new Error(String(mapError))
-        );
+        const errorContext = {
+          row: JSON.stringify(row).substring(0, 200),
+          error: mapError instanceof Error ? mapError.message : String(mapError),
+          stack: mapError instanceof Error ? mapError.stack : undefined,
+        };
+        logger.error(errorContext, 'Error mapping device row');
+        console.error('[ERROR] Error mapping device row:', {
+          ...errorContext,
+          fullError: mapError,
+        });
         // Return a minimal valid device object to prevent complete failure
         return {
           device_id: String(row.device_id || 'unknown'),
@@ -172,14 +176,16 @@ router.get('/devices', async (req: Request, res: Response) => {
     try {
       JSON.stringify(response);
     } catch (serializeError) {
-      logger.error(
-        'Response serialization failed',
-        {
-          error: serializeError instanceof Error ? serializeError.message : String(serializeError),
-          devicesCount: devices.length,
-        },
-        serializeError instanceof Error ? serializeError : new Error(String(serializeError))
-      );
+      const errorContext = {
+        error: serializeError instanceof Error ? serializeError.message : String(serializeError),
+        stack: serializeError instanceof Error ? serializeError.stack : undefined,
+        devicesCount: devices.length,
+      };
+      logger.error(errorContext, 'Response serialization failed');
+      console.error('[ERROR] Response serialization failed:', {
+        ...errorContext,
+        fullError: serializeError,
+      });
       throw new Error('Failed to serialize response');
     }
     
@@ -189,21 +195,24 @@ router.get('/devices', async (req: Request, res: Response) => {
     const errorStack = error instanceof Error ? error.stack : undefined;
     const errorName = error instanceof Error ? error.name : typeof error;
     
-    // Log full error details
-    logger.error(
-      'Failed to get devices',
-      {
-        userId: (req as any).userId,
-        error: errorMessage,
-        errorName,
-        stack: errorStack,
-        path: req.path,
-        method: req.method,
-        hasDatabase: !!database,
-        hasSessionsMap: !!sessionsMap,
-      },
-      error instanceof Error ? error : new Error(String(error))
-    );
+    // Log full error details - use console.error as fallback to ensure visibility
+    const errorContext = {
+      userId: (req as any).userId,
+      error: errorMessage,
+      errorName,
+      stack: errorStack,
+      path: req.path,
+      method: req.method,
+      hasDatabase: !!database,
+      hasSessionsMap: !!sessionsMap,
+    };
+    
+    // Log with both logger and console.error to ensure visibility
+    logger.error(errorContext, 'Failed to get devices');
+    console.error('[ERROR] Failed to get devices:', {
+      ...errorContext,
+      fullError: error,
+    });
     
     // Return error response with details in development
     const isDevelopment = process.env.NODE_ENV === 'development';
