@@ -278,6 +278,14 @@ async function handleClientHello(
 
     // Generate server ephemeral keypair
     const serverEphemeralKeypair = generateECDHKeypair();
+    if (!serverEphemeralKeypair || !serverEphemeralKeypair.publicKey || !serverEphemeralKeypair.privateKey) {
+      logger.error('handleClientHello: Failed to generate server ephemeral keypair', {
+        hasKeypair: !!serverEphemeralKeypair,
+        hasPublicKey: !!serverEphemeralKeypair?.publicKey,
+        hasPrivateKey: !!serverEphemeralKeypair?.privateKey,
+      });
+      throw new Error('Failed to generate server ephemeral keypair');
+    }
     const nonceS = generateNonce();
 
     // Compute shared secret

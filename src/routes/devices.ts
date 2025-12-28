@@ -54,11 +54,27 @@ router.get('/devices', async (req: Request, res: Response) => {
     }
 
     // Update user activity (create user if doesn't exist)
-    await database.pool.query(
-      `INSERT INTO users (user_id, last_activity) VALUES ($1, NOW())
-       ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()`,
-      [userId]
-    );
+    // Handle case where last_activity column might not exist (migration not run)
+    try {
+      await database.pool.query(
+        `INSERT INTO users (user_id, last_activity) VALUES ($1, NOW())
+         ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()`,
+        [userId]
+      );
+    } catch (activityError: any) {
+      // If last_activity column doesn't exist, try without it
+      if (activityError?.code === '42703') {
+        logger.warn('last_activity column not found, using fallback query', { userId });
+        await database.pool.query(
+          `INSERT INTO users (user_id) VALUES ($1)
+           ON CONFLICT (user_id) DO NOTHING`,
+          [userId]
+        );
+      } else {
+        // Re-throw if it's a different error
+        throw activityError;
+      }
+    }
 
     // Get all devices for user (from devices table)
     let result;
