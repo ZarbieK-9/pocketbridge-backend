@@ -237,16 +237,18 @@ export async function handleEvent(
           ]);
 
           // Store event
+          // Use sessionState.deviceId to ensure we have the correct UUID format
+          // encryptedEvent.device_id should match, but we use sessionState for safety
           await client.query(
             `INSERT INTO events (
                 event_id, user_id, device_id, device_seq, stream_id, stream_seq,
                 type, encrypted_payload, payload_size, ttl, created_at
-              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+              ) VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10, NOW())
               ON CONFLICT (event_id) DO NOTHING`,
             [
               encryptedEvent.event_id,
               encryptedEvent.user_id,
-              encryptedEvent.device_id,
+              sessionState.deviceId, // Use sessionState.deviceId (guaranteed to be UUID)
               encryptedEvent.device_seq,
               encryptedEvent.stream_id,
               streamSeq,
