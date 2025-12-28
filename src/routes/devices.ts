@@ -61,58 +61,128 @@ router.get('/devices', async (req: Request, res: Response) => {
     );
 
     // Get all devices for user (from devices table)
-    const result = await database.pool.query(
-      `SELECT 
-        device_id, device_name, device_type, device_os,
-        last_seen, registered_at, ip_address
-       FROM user_devices
-       WHERE user_id = $1
-       ORDER BY last_seen DESC`,
-      [userId]
-    );
+    let result;
+    try {
+      result = await database.pool.query(
+        `SELECT 
+          device_id, device_name, device_type, device_os,
+          last_seen, registered_at, ip_address
+         FROM user_devices
+         WHERE user_id = $1
+         ORDER BY last_seen DESC`,
+        [userId]
+      );
+    } catch (queryError) {
+      logger.error(
+        'Database query failed in get devices',
+        {
+          userId,
+          error: queryError instanceof Error ? queryError.message : String(queryError),
+        },
+        queryError instanceof Error ? queryError : new Error(String(queryError))
+      );
+      throw queryError;
+    }
 
     const devices: DeviceInfo[] = result.rows.map((row: any) => {
-      // Convert device_id to string for sessionsMap lookup (sessionsMap uses string keys)
-      const deviceIdStr = typeof row.device_id === 'string' 
-        ? row.device_id 
-        : row.device_id?.toString() || String(row.device_id);
-      
-      // Safely convert last_seen to timestamp
-      let lastSeenTimestamp: number;
       try {
-        lastSeenTimestamp = row.last_seen 
-          ? new Date(row.last_seen).getTime() 
-          : Date.now();
-      } catch {
-        lastSeenTimestamp = Date.now();
+        // Convert device_id to string for sessionsMap lookup (sessionsMap uses string keys)
+        const deviceIdStr = typeof row.device_id === 'string' 
+          ? row.device_id 
+          : row.device_id?.toString() || String(row.device_id);
+        
+        // Safely convert last_seen to timestamp
+        let lastSeenTimestamp: number;
+        try {
+          lastSeenTimestamp = row.last_seen 
+            ? new Date(row.last_seen).getTime() 
+            : Date.now();
+          // Validate timestamp is a valid number
+          if (isNaN(lastSeenTimestamp)) {
+            logger.warn('Invalid last_seen timestamp, using current time', {
+              deviceId: deviceIdStr,
+              lastSeen: row.last_seen,
+            });
+            lastSeenTimestamp = Date.now();
+          }
+        } catch {
+          lastSeenTimestamp = Date.now();
+        }
+        
+        // Validate device_type is one of the allowed values
+        let deviceType: 'mobile' | 'desktop' | 'web' | undefined = undefined;
+        if (row.device_type) {
+          if (['mobile', 'desktop', 'web'].includes(row.device_type)) {
+            deviceType = row.device_type as 'mobile' | 'desktop' | 'web';
+          } else {
+            logger.warn('Invalid device_type, setting to undefined', {
+              deviceId: deviceIdStr,
+              deviceType: row.device_type,
+            });
+          }
+        }
+        
+        return {
+          device_id: deviceIdStr,
+          device_name: row.device_name || undefined,
+          device_type: deviceType,
+          device_os: row.device_os || undefined,
+          is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
+          last_seen: lastSeenTimestamp,
+          ip_address: row.ip_address ? String(row.ip_address) : undefined,
+        };
+      } catch (mapError) {
+        logger.error(
+          'Error mapping device row',
+          {
+            row: JSON.stringify(row).substring(0, 200),
+            error: mapError instanceof Error ? mapError.message : String(mapError),
+          },
+          mapError instanceof Error ? mapError : new Error(String(mapError))
+        );
+        // Return a minimal valid device object to prevent complete failure
+        return {
+          device_id: String(row.device_id || 'unknown'),
+          is_online: false,
+          last_seen: Date.now(),
+        };
       }
-      
-      return {
-        device_id: deviceIdStr,
-        device_name: row.device_name || undefined,
-        device_type: (row.device_type as 'mobile' | 'desktop' | 'web' | undefined) || undefined,
-        device_os: row.device_os || undefined,
-        is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
-        last_seen: lastSeenTimestamp,
-        ip_address: row.ip_address || undefined,
-      };
     });
 
     // Handle empty state
     const is_empty = devices.length === 0;
+    
+    // Build response object, ensuring all values are JSON-serializable
     const response: {
       devices: DeviceInfo[];
       count: number;
       is_empty: boolean;
       message?: string;
     } = {
-      devices,
+      devices: devices.filter(d => d !== null && d !== undefined), // Remove any null/undefined devices
       count: devices.length,
       is_empty,
     };
+    
     if (is_empty) {
       response.message = 'No devices connected. Connect a device to start syncing.';
     }
+    
+    // Validate response is serializable before sending
+    try {
+      JSON.stringify(response);
+    } catch (serializeError) {
+      logger.error(
+        'Response serialization failed',
+        {
+          error: serializeError instanceof Error ? serializeError.message : String(serializeError),
+          devicesCount: devices.length,
+        },
+        serializeError instanceof Error ? serializeError : new Error(String(serializeError))
+      );
+      throw new Error('Failed to serialize response');
+    }
+    
     return res.json(response);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
