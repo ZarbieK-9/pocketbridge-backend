@@ -1,11 +1,11 @@
 /**
  * Rate Limiting Middleware
- * 
+ *
  * Protects against:
  * - DoS attacks
  * - Event flooding
  * - Resource exhaustion
- * 
+ *
  * Tracks by:
  * - IP: Connection/handshake attempts (prevent brute force)
  * - User ID: Concurrent devices, event rate (prevent abuse per user)
@@ -25,7 +25,7 @@ interface RateLimitStore {
   };
 }
 
-class RateLimiter {
+export class RateLimiter {
   private store: RateLimitStore = {};
   private config: RateLimitConfig;
 
@@ -130,7 +130,7 @@ export function getClientIdentifier(req: any): string {
  */
 export function rateLimitConnection(identifier: string): { allowed: boolean; error?: string } {
   const result = connectionRateLimiter.check(identifier);
-  
+
   if (!result.allowed) {
     logger.warn('Connection rate limit exceeded', { identifier });
     return {
@@ -147,7 +147,7 @@ export function rateLimitConnection(identifier: string): { allowed: boolean; err
  */
 export function rateLimitEvent(deviceId: string): { allowed: boolean; error?: string } {
   const result = eventRateLimiter.check(deviceId);
-  
+
   if (!result.allowed) {
     logger.warn('Event rate limit exceeded', { deviceId });
     return {
@@ -164,7 +164,7 @@ export function rateLimitEvent(deviceId: string): { allowed: boolean; error?: st
  */
 export function rateLimitHandshake(identifier: string): { allowed: boolean; error?: string } {
   const result = handshakeRateLimiter.check(identifier);
-  
+
   if (!result.allowed) {
     logger.warn('Handshake rate limit exceeded', { identifier });
     return {
@@ -201,11 +201,18 @@ export function untrackUserDevice(userId: string, deviceId: string): void {
 /**
  * Check concurrent device limit per user (max 5 devices per user)
  */
-export function checkConcurrentDeviceLimit(userId: string, maxDevices: number = 5): { allowed: boolean; error?: string } {
+export function checkConcurrentDeviceLimit(
+  userId: string,
+  maxDevices: number = 5
+): { allowed: boolean; error?: string } {
   const deviceCount = userDevices[userId]?.size || 0;
-  
+
   if (deviceCount >= maxDevices) {
-    logger.warn('User concurrent device limit exceeded', { userId: userId.substring(0, 16) + '...', deviceCount, maxDevices });
+    logger.warn('User concurrent device limit exceeded', {
+      userId: userId.substring(0, 16) + '...',
+      deviceCount,
+      maxDevices,
+    });
     return {
       allowed: false,
       error: `Too many devices connected (max ${maxDevices}). Please disconnect another device.`,
@@ -227,7 +234,7 @@ export function getConcurrentDeviceCount(userId: string): number {
  */
 export function rateLimitUserEvent(userId: string): { allowed: boolean; error?: string } {
   const result = userEventRateLimiter.check(userId);
-  
+
   if (!result.allowed) {
     logger.warn('User event rate limit exceeded', { userId: userId.substring(0, 16) + '...' });
     return {
@@ -238,15 +245,3 @@ export function rateLimitUserEvent(userId: string): { allowed: boolean; error?: 
 
   return { allowed: true };
 }
-
-
-
-
-
-
-
-
-
-
-
-

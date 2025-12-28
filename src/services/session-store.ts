@@ -1,6 +1,6 @@
 /**
  * Session Store Service
- * 
+ *
  * Stores sessions in Redis for horizontal scaling
  * Falls back to in-memory if Redis unavailable
  */
@@ -32,7 +32,11 @@ export async function storeSession(
 
     await redis.client.setEx(key, SESSION_TTL, value);
   } catch (error) {
-    logger.error('Failed to store session in Redis', { deviceId: sessionState.deviceId }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to store session in Redis',
+      { deviceId: sessionState.deviceId },
+      error instanceof Error ? error : new Error(String(error))
+    );
     // Fallback: continue without Redis storage
   }
 }
@@ -54,7 +58,11 @@ export async function loadSession(
 
     return JSON.parse(value) as Partial<SessionState>;
   } catch (error) {
-    logger.error('Failed to load session from Redis', { deviceId }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to load session from Redis',
+      { deviceId },
+      error instanceof Error ? error : new Error(String(error))
+    );
     return null;
   }
 }
@@ -62,15 +70,16 @@ export async function loadSession(
 /**
  * Delete session from Redis
  */
-export async function deleteSession(
-  redis: RedisConnection,
-  deviceId: string
-): Promise<void> {
+export async function deleteSession(redis: RedisConnection, deviceId: string): Promise<void> {
   try {
     const key = `${SESSION_KEY_PREFIX}${deviceId}`;
     await redis.client.del(key);
   } catch (error) {
-    logger.error('Failed to delete session from Redis', { deviceId }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to delete session from Redis',
+      { deviceId },
+      error instanceof Error ? error : new Error(String(error))
+    );
   }
 }
 
@@ -83,18 +92,3 @@ export async function updateSession(
 ): Promise<void> {
   await storeSession(redis, sessionState);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

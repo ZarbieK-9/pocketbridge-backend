@@ -1,19 +1,19 @@
 /**
  * PostgreSQL Database Connection and Schema
- * 
+ *
  * Production-ready with:
  * - Connection pooling
  * - Retry logic
  * - Health checks
  * - Migration support
- * 
+ *
  * Stores:
  * - Public keys (Ed25519) for user identity
  * - Device metadata
  * - Event metadata (for replay index)
  * - last_ack_device_seq per device
  * - Revoked devices
- * 
+ *
  * NEVER stores:
  * - Private keys
  * - Plaintext payloads
@@ -23,6 +23,8 @@
 import pg from 'pg';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { databaseCircuitBreaker } from '../services/circuit-breaker.js';
+import { incrementCounter, recordHistogram, setGauge } from '../services/metrics.js';
 
 const { Pool } = pg;
 
@@ -62,9 +64,53 @@ export async function initDatabase(): Promise<Database> {
   const pool = new Pool(poolConfig);
 
   // Handle pool errors
-  pool.on('error', (err) => {
+  pool.on('error', err => {
     logger.error('Unexpected database pool error', {}, err);
+    incrementCounter('database_pool_errors_total');
   });
+
+  // Monitor pool health metrics every 5 seconds
+  const poolMonitoringInterval = setInterval(() => {
+    try {
+      // Track pool metrics
+      setGauge('database_pool_total', pool.totalCount);
+      setGauge('database_pool_idle', pool.idleCount);
+      setGauge('database_pool_active', pool.totalCount - pool.idleCount);
+      setGauge('database_pool_waiting', pool.waitingCount);
+
+      // Log warning if pool is getting exhausted
+      const poolUtilization = (pool.totalCount - pool.idleCount) / pool.totalCount;
+      if (poolUtilization > 0.8) {
+        logger.warn('Database pool utilization high', {
+          total: pool.totalCount,
+          active: pool.totalCount - pool.idleCount,
+          idle: pool.idleCount,
+          waiting: pool.waitingCount,
+          utilization: `${(poolUtilization * 100).toFixed(1)}%`,
+        });
+      }
+
+      // Alert if there are waiting connections
+      if (pool.waitingCount > 0) {
+        logger.warn('Database pool has waiting connections', {
+          waiting: pool.waitingCount,
+          total: pool.totalCount,
+          active: pool.totalCount - pool.idleCount,
+          idle: pool.idleCount,
+        });
+        incrementCounter('database_pool_waiting_connections_total');
+      }
+    } catch (error) {
+      logger.error(
+        'Failed to monitor database pool',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }, 5000);
+
+  // Store interval ID for cleanup (will be used in end function)
+  (pool as any)._monitoringInterval = poolMonitoringInterval;
 
   // Retry connection with exponential backoff
   // Increased retries and delays for Railway deployment
@@ -82,19 +128,26 @@ export async function initDatabase(): Promise<Database> {
     } catch (error) {
       retries--;
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.warn(`PostgreSQL connection failed: ${errorMessage}. Retrying in ${delay}ms... (${retries} retries left)`, {
-        error: errorMessage,
-        retriesLeft: retries,
-      });
-      
+      logger.warn(
+        `PostgreSQL connection failed: ${errorMessage}. Retrying in ${delay}ms... (${retries} retries left)`,
+        {
+          error: errorMessage,
+          retriesLeft: retries,
+        }
+      );
+
       if (retries === 0) {
-        logger.error('Failed to connect to PostgreSQL after all retries', {
-          totalRetries: 10,
-          finalError: errorMessage,
-        }, error instanceof Error ? error : new Error(String(error)));
+        logger.error(
+          'Failed to connect to PostgreSQL after all retries',
+          {
+            totalRetries: 10,
+            finalError: errorMessage,
+          },
+          error instanceof Error ? error : new Error(String(error))
+        );
         throw error;
       }
-      
+
       await new Promise(resolve => setTimeout(resolve, delay));
       delay = Math.min(delay * 1.5, 10000); // Exponential backoff, max 10 seconds
     }
@@ -103,21 +156,125 @@ export async function initDatabase(): Promise<Database> {
   // Initialize schema
   await initSchema(pool);
 
+  // Wrap pool.query to add slow query logging
+  const SLOW_QUERY_THRESHOLD_MS = 1000; // Log queries taking > 1 second
+  const originalQuery = pool.query.bind(pool);
+
+  (pool as any).query = function (text: any, params?: any, callback?: any): any {
+    const startTime = Date.now();
+    const queryText = typeof text === 'string' ? text : text?.text || text?.query || 'unknown';
+
+    // If callback is provided, use callback-based API
+    if (callback && typeof callback === 'function') {
+      return originalQuery(text, params, (err: any, res: any) => {
+        const duration = Date.now() - startTime;
+        logQueryMetrics(queryText, duration, params);
+        callback(err, res);
+      });
+    }
+
+    // Otherwise, use promise-based API
+    const result = originalQuery(text, params);
+
+    if (result && typeof result.then === 'function') {
+      return result.then(
+        (res: any) => {
+          const duration = Date.now() - startTime;
+          logQueryMetrics(queryText, duration, params);
+          return res;
+        },
+        (err: any) => {
+          const duration = Date.now() - startTime;
+          recordHistogram('database_query_duration_ms', duration, {
+            operation: extractOperation(queryText),
+            status: 'error',
+          });
+          incrementCounter('database_queries_total', {
+            operation: extractOperation(queryText),
+            status: 'error',
+          });
+          throw err;
+        }
+      );
+    }
+
+    return result;
+  };
+
+  /**
+   * Log query metrics and slow query warnings
+   */
+  function logQueryMetrics(queryText: string, duration: number, params?: any): void {
+    const operation = extractOperation(queryText);
+
+    // Record query duration
+    recordHistogram('database_query_duration_ms', duration, { operation });
+    incrementCounter('database_queries_total', { operation, status: 'success' });
+
+    // Log slow queries
+    if (duration > SLOW_QUERY_THRESHOLD_MS) {
+      logger.warn('Slow database query detected', {
+        duration: `${duration}ms`,
+        query: queryText.substring(0, 200), // Truncate long queries
+        params: params ? (Array.isArray(params) ? `[${params.length} params]` : 'object') : 'none',
+        operation,
+      });
+      incrementCounter('database_slow_queries_total', { operation });
+    }
+  }
+
   return {
     pool,
     end: async () => {
+      // Clear pool monitoring interval
+      if ((pool as any)._monitoringInterval) {
+        clearInterval((pool as any)._monitoringInterval);
+      }
       await pool.end();
       logger.info('PostgreSQL connection pool closed');
     },
     healthCheck: async () => {
       try {
-        await pool.query('SELECT 1');
+        const startTime = Date.now();
+        await databaseCircuitBreaker.execute(async () => {
+          await pool.query('SELECT 1');
+        }, 'database');
+        const duration = Date.now() - startTime;
+        recordHistogram('database_query_duration_ms', duration, { operation: 'health_check' });
+        incrementCounter('database_queries_total', {
+          operation: 'health_check',
+          status: 'success',
+        });
         return true;
-      } catch {
+      } catch (error) {
+        incrementCounter('database_queries_total', { operation: 'health_check', status: 'error' });
+        logger.error(
+          'Database health check failed',
+          {},
+          error instanceof Error ? error : new Error(String(error))
+        );
         return false;
       }
     },
   };
+}
+
+/**
+ * Extract operation name from SQL query for metrics
+ */
+function extractOperation(queryText: string): string {
+  const upperQuery = queryText.trim().toUpperCase();
+  if (upperQuery.startsWith('SELECT')) return 'select';
+  if (upperQuery.startsWith('INSERT')) return 'insert';
+  if (upperQuery.startsWith('UPDATE')) return 'update';
+  if (upperQuery.startsWith('DELETE')) return 'delete';
+  if (
+    upperQuery.startsWith('BEGIN') ||
+    upperQuery.startsWith('COMMIT') ||
+    upperQuery.startsWith('ROLLBACK')
+  )
+    return 'transaction';
+  return 'other';
 }
 
 /**
@@ -152,8 +309,16 @@ async function initSchema(pool: pg.Pool): Promise<void> {
       public_key_hex TEXT,
       registered_at TIMESTAMP NOT NULL DEFAULT NOW(),
       last_ack_device_seq BIGINT NOT NULL DEFAULT 0,
-      CONSTRAINT valid_device_name CHECK (length(device_name) <= 50)
+      CONSTRAINT valid_device_name CHECK (length(device_name) <= 50),
+      CONSTRAINT valid_device_type CHECK (device_type IS NULL OR device_type IN ('mobile', 'desktop', 'web'))
     )
+  `);
+
+  // Add unique index for device names per user (if not exists)
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_user_name 
+    ON user_devices(user_id, device_name) 
+    WHERE device_name IS NOT NULL
   `);
 
   // Backward-compatible legacy devices table (kept for older data)

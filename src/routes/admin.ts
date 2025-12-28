@@ -1,6 +1,6 @@
 /**
  * Admin Routes
- * 
+ *
  * Device revocation and admin operations
  * NOTE: In production, add authentication/authorization middleware
  */
@@ -9,6 +9,7 @@ import { Router, Request, Response } from 'express';
 import { revokeDevice, unrevokeDevice, getRevokedDevices } from '../services/device-revocation.js';
 import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
+import { adminAuthMiddleware } from '../middleware/admin-auth.js';
 
 // NOTE: In production, inject db via dependency injection
 // For now, we'll need to pass it from index.ts
@@ -20,10 +21,14 @@ export function setDatabase(db: any) {
 
 const router = Router();
 
+// Protect all admin routes with authentication
+router.use(adminAuthMiddleware);
+
 /**
  * Revoke a device
  * POST /admin/revoke-device
  * Body: { deviceId, userId, reason?, revokedBy? }
+ * Headers: X-Admin-API-Key: <admin_api_key>
  */
 router.post('/revoke-device', async (req: Request, res: Response) => {
   try {
@@ -40,7 +45,11 @@ router.post('/revoke-device', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Device revoked' });
   } catch (error) {
-    logger.error('Failed to revoke device', { body: req.body }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to revoke device',
+      { body: req.body },
+      error instanceof Error ? error : new Error(String(error))
+    );
     res.status(500).json({ error: 'Failed to revoke device' });
   }
 });
@@ -65,7 +74,11 @@ router.post('/unrevoke-device', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Device unrevoked' });
   } catch (error) {
-    logger.error('Failed to unrevoke device', { body: req.body }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to unrevoke device',
+      { body: req.body },
+      error instanceof Error ? error : new Error(String(error))
+    );
     res.status(500).json({ error: 'Failed to unrevoke device' });
   }
 });
@@ -89,10 +102,13 @@ router.get('/revoked-devices', async (req: Request, res: Response) => {
 
     res.json({ revoked });
   } catch (error) {
-    logger.error('Failed to get revoked devices', { query: req.query }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to get revoked devices',
+      { query: req.query },
+      error instanceof Error ? error : new Error(String(error))
+    );
     res.status(500).json({ error: 'Failed to get revoked devices' });
   }
 });
 
 export default router;
-

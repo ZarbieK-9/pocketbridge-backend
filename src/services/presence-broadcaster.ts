@@ -1,9 +1,9 @@
 /**
  * Device Presence Broadcaster
- * 
+ *
  * Broadcasts device online/offline status via Redis pub/sub
  * Allows clients to be notified when other devices come online/offline
- * 
+ *
  * Redis channels:
  * - user:{user_id}:devices - Device list for user (published when device online/offline)
  * - user:{user_id}:device:online - Device came online
@@ -20,10 +20,7 @@ export class PresenceBroadcaster {
   /**
    * Publish device online event
    */
-  async publishDeviceOnline(
-    userId: string,
-    device: DeviceInfo
-  ): Promise<void> {
+  async publishDeviceOnline(userId: string, device: DeviceInfo): Promise<void> {
     try {
       const channel = `user:${userId}:device:online`;
       const message = JSON.stringify(device);
@@ -36,17 +33,18 @@ export class PresenceBroadcaster {
         channel,
       });
     } catch (error) {
-      logger.error('Failed to publish device online', {}, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to publish device online',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
     }
   }
 
   /**
    * Publish device offline event
    */
-  async publishDeviceOffline(
-    userId: string,
-    deviceId: string
-  ): Promise<void> {
+  async publishDeviceOffline(userId: string, deviceId: string): Promise<void> {
     try {
       const channel = `user:${userId}:device:offline`;
       const message = JSON.stringify({ device_id: deviceId });
@@ -59,17 +57,18 @@ export class PresenceBroadcaster {
         channel,
       });
     } catch (error) {
-      logger.error('Failed to publish device offline', {}, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to publish device offline',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
     }
   }
 
   /**
    * Publish full device list (presence) for user
    */
-  async publishDeviceList(
-    userId: string,
-    devices: DeviceInfo[]
-  ): Promise<void> {
+  async publishDeviceList(userId: string, devices: DeviceInfo[]): Promise<void> {
     try {
       const channel = `user:${userId}:devices`;
       const message = JSON.stringify({
@@ -87,7 +86,11 @@ export class PresenceBroadcaster {
         channel,
       });
     } catch (error) {
-      logger.error('Failed to publish device list', {}, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to publish device list',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
     }
   }
 
@@ -108,7 +111,11 @@ export class PresenceBroadcaster {
         await this.redisClient.del(key);
       }
     } catch (error) {
-      logger.error('Failed to cache device status', {}, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to cache device status',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
     }
   }
 
@@ -121,7 +128,11 @@ export class PresenceBroadcaster {
       const status = await this.redisClient.get(key);
       return status === '1';
     } catch (error) {
-      logger.error('Failed to get device status', {}, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to get device status',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
       return false;
     }
   }
@@ -129,11 +140,7 @@ export class PresenceBroadcaster {
   /**
    * Publish a broadcast message to all user's devices
    */
-  async broadcastToUser(
-    userId: string,
-    eventType: string,
-    payload: any
-  ): Promise<void> {
+  async broadcastToUser(userId: string, eventType: string, payload: any): Promise<void> {
     try {
       const channel = `user:${userId}:broadcast`;
       const message = JSON.stringify({
@@ -149,7 +156,11 @@ export class PresenceBroadcaster {
         eventType,
       });
     } catch (error) {
-      logger.error('Failed to broadcast to user', {}, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to broadcast to user',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
     }
   }
 }

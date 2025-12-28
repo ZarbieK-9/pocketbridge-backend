@@ -1,9 +1,9 @@
 /**
  * Multi-Device Session Manager
- * 
+ *
  * Manages sessions grouped by user_id, with per-device tracking
  * Structure: sessions[user_id][device_id] = SessionState
- * 
+ *
  * Key operations:
  * - Add device session
  * - Remove device session
@@ -22,7 +22,7 @@ interface UserSessions {
 export class MultiDeviceSessionManager {
   // Sessions organized by user_id -> device_id -> SessionState
   private sessions = new Map<string, UserSessions>();
-  
+
   // Track WebSocket connections per session for cleanup
   private sessionWebSockets = new Map<string, WebSocket>(); // Key: `${user_id}:${device_id}`
 
@@ -122,9 +122,9 @@ export class MultiDeviceSessionManager {
     return {
       total_users: this.sessions.size,
       total_sessions: this.getTotalSessions(),
-      users_with_multiple_devices: Array.from(this.sessions.entries())
-        .filter(([_, sessions]) => Object.keys(sessions).length > 1)
-        .length,
+      users_with_multiple_devices: Array.from(this.sessions.entries()).filter(
+        ([_, sessions]) => Object.keys(sessions).length > 1
+      ).length,
     };
   }
 
@@ -137,16 +137,17 @@ export class MultiDeviceSessionManager {
 
   /**
    * Broadcast message to all devices of a user (except optionally one device)
+   * Optimized: Parallel sends using Promise.all() for better performance
    */
-  broadcastToUser(
+  async broadcastToUser(
     userId: string,
     message: string,
     excludeDeviceId?: string
-  ): { sent: number; failed: number } {
+  ): Promise<{ sent: number; failed: number }> {
     const userSessions = this.sessions.get(userId) || {};
-    let sent = 0;
-    let failed = 0;
+    const targetDevices: Array<{ deviceId: string; ws: WebSocket }> = [];
 
+    // Collect all target devices with valid WebSocket connections
     for (const [deviceId, _session] of Object.entries(userSessions)) {
       if (excludeDeviceId && deviceId === excludeDeviceId) {
         continue;
@@ -154,13 +155,52 @@ export class MultiDeviceSessionManager {
 
       const ws = this.getWebSocket(userId, deviceId);
       if (ws && ws.readyState === ws.OPEN) {
-        try {
-          ws.send(message);
-          sent++;
-        } catch (error) {
-          logger.error('Failed to send message to device', { deviceId }, error);
-          failed++;
-        }
+        targetDevices.push({ deviceId, ws });
+      }
+    }
+
+    // If no target devices, return early
+    if (targetDevices.length === 0) {
+      return { sent: 0, failed: 0 };
+    }
+
+    // Send to all devices in parallel
+    const sendPromises = targetDevices.map(async ({ deviceId, ws }) => {
+      try {
+        // WebSocket.send() is synchronous but we wrap in Promise for consistency
+        // and to handle potential errors uniformly
+        return new Promise<{ success: boolean; deviceId: string }>(resolve => {
+          try {
+            ws.send(message);
+            resolve({ success: true, deviceId });
+          } catch (error) {
+            logger.error(
+              'Failed to send message to device',
+              { deviceId },
+              error instanceof Error ? error : new Error(String(error))
+            );
+            resolve({ success: false, deviceId });
+          }
+        });
+      } catch (error) {
+        logger.error(
+          'Failed to send message to device',
+          { deviceId },
+          error instanceof Error ? error : new Error(String(error))
+        );
+        return { success: false, deviceId };
+      }
+    });
+
+    // Wait for all sends to complete (parallel execution)
+    const results = await Promise.all(sendPromises);
+
+    // Count successes and failures
+    let sent = 0;
+    let failed = 0;
+    for (const result of results) {
+      if (result.success) {
+        sent++;
       } else {
         failed++;
       }

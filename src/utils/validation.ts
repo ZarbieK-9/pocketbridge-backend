@@ -1,6 +1,6 @@
 /**
  * Input Validation Utilities
- * 
+ *
  * Validates all user inputs to prevent:
  * - Injection attacks
  * - DoS via large inputs
@@ -33,6 +33,13 @@ export function validateUUIDv7(id: string): boolean {
   // UUIDv7: xxxxxxxx-xxxx-7xxx-xxxx-xxxxxxxxxxxx
   const uuidv7Regex = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   return uuidv7Regex.test(id);
+}
+
+/**
+ * Validate generic UUID format (v4 or v7)
+ */
+export function validateUUID(id: string): boolean {
+  return validateUUIDv4(id) || validateUUIDv7(id);
 }
 
 /**
@@ -183,9 +190,59 @@ export function validateNonceFormat(nonce: string): boolean {
   return hexRegex.test(nonce);
 }
 
+/**
+ * Sanitize device name to ensure valid UTF-8 encoding
+ * Removes invalid UTF-8 sequences and truncates to max length
+ *
+ * @param name - Device name to sanitize
+ * @param maxLength - Maximum length (default: 50)
+ * @returns Sanitized device name
+ */
+export function sanitizeDeviceName(name: string, maxLength: number = 50): string {
+  if (typeof name !== 'string') {
+    return '';
+  }
 
+  try {
+    // Try to decode and re-encode as UTF-8 to remove invalid sequences
+    const sanitized = Buffer.from(name, 'utf8').toString('utf8');
+    // Truncate to max length
+    return sanitized.slice(0, maxLength);
+  } catch {
+    // If UTF-8 encoding fails, fall back to ASCII-only
+    // Remove non-printable characters and keep only ASCII printable range (32-126)
+    const asciiOnly = name
+      .split('')
+      .filter(char => {
+        const code = char.charCodeAt(0);
+        return code >= 32 && code <= 126; // Printable ASCII range
+      })
+      .join('');
+    return asciiOnly.slice(0, maxLength);
+  }
+}
 
+/**
+ * Validate TTL with clock skew tolerance
+ *
+ * Allows ±5 minutes tolerance for clock differences between devices
+ *
+ * @param ttl - TTL timestamp (Unix timestamp in milliseconds)
+ * @param toleranceMs - Clock skew tolerance in milliseconds (default: 5 minutes)
+ * @returns true if TTL is valid (not expired considering tolerance), false otherwise
+ */
+export function validateTTL(ttl: number | undefined, toleranceMs: number = 5 * 60 * 1000): boolean {
+  if (ttl === undefined || ttl === null) {
+    return true; // No TTL means no expiration
+  }
 
+  if (typeof ttl !== 'number') {
+    throw new ValidationError('TTL must be a number');
+  }
 
-
-
+  const now = Date.now();
+  // Consider TTL valid if it's within tolerance (allows for clock skew)
+  // TTL is valid if: ttl >= (now - tolerance)
+  // This means events are considered expired only if ttl < (now - tolerance)
+  return ttl >= now - toleranceMs;
+}

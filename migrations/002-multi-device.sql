@@ -1,5 +1,8 @@
 -- Migration: Create multi-device user tracking tables
--- Run: psql -d pocketbridge < migrations/002-multi-device.sql
+-- Version: 2
+-- Description: Adds multi-device support with user_devices and user_sessions tables
+
+-- UP
 
 -- Users table: Groups devices by user identity (Ed25519 public key)
 CREATE TABLE IF NOT EXISTS users (

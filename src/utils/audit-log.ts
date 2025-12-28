@@ -1,6 +1,6 @@
 /**
  * Audit Logging
- * 
+ *
  * Logs security-relevant events for audit trail
  */
 
@@ -15,6 +15,7 @@ export enum AuditEventType {
   SESSION_EXPIRED = 'session_expired',
   HANDSHAKE_TIMEOUT = 'handshake_timeout',
   DEVICE_REVOKED = 'device_revoked',
+  SECURITY_VIOLATION = 'security_violation',
 }
 
 interface AuditLogEntry {
@@ -50,18 +51,3 @@ export function auditLog(
     ...entry,
   });
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1,6 +1,6 @@
 /**
  * Connection Limits
- * 
+ *
  * Enforces maximum concurrent connections per user/device
  */
 
@@ -19,7 +19,10 @@ const deviceConnections = new Map<string, number>();
 /**
  * Check if new connection is allowed
  */
-export function checkConnectionLimit(userId: string, deviceId: string): { allowed: boolean; error?: string } {
+export function checkConnectionLimit(
+  userId: string,
+  deviceId: string
+): { allowed: boolean; error?: string } {
   const userCount = userConnections.get(userId) || 0;
   const deviceCount = deviceConnections.get(deviceId) || 0;
 
@@ -48,7 +51,7 @@ export function checkConnectionLimit(userId: string, deviceId: string): { allowe
 export function incrementConnection(userId: string, deviceId: string): void {
   const userCount = userConnections.get(userId) || 0;
   const deviceCount = deviceConnections.get(deviceId) || 0;
-  
+
   userConnections.set(userId, userCount + 1);
   deviceConnections.set(deviceId, deviceCount + 1);
 }
@@ -59,7 +62,7 @@ export function incrementConnection(userId: string, deviceId: string): void {
 export function decrementConnection(userId: string, deviceId: string): void {
   const userCount = userConnections.get(userId) || 0;
   const deviceCount = deviceConnections.get(deviceId) || 0;
-  
+
   if (userCount > 0) {
     userConnections.set(userId, userCount - 1);
   }
@@ -67,18 +70,3 @@ export function decrementConnection(userId: string, deviceId: string): void {
     deviceConnections.set(deviceId, deviceCount - 1);
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

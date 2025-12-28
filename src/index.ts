@@ -1,7 +1,23 @@
 /**
  * PocketBridge Backend - Main Entry Point
- * 
- * Production-grade event-driven backend with:
+ *
+ * ALWAYS ACTIVE RELAY SYSTEM
+ * ==========================
+ * This backend is always running and acts as a relay system that connects devices.
+ *
+ * Core Functionality:
+ * - Always active: Server runs continuously, ready to connect devices
+ * - Device Relay: Automatically routes messages between devices of the same user
+ * - Multi-User Support: Handles multiple users simultaneously
+ * - User Isolation: Each user can only see and communicate with their own devices
+ *
+ * How It Works:
+ * 1. Device A connects → identifies with user_id
+ * 2. Device B connects → identifies with same user_id
+ * 3. Backend automatically relays messages between Device A and Device B
+ * 4. Users are completely isolated - User 1's devices never see User 2's devices
+ *
+ * Technical Stack:
  * - WebSocket gateway for real-time communication
  * - PostgreSQL for metadata and replay index
  * - Redis for Pub/Sub and presence
@@ -26,14 +42,27 @@ import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { errorHandler } from './utils/errors.js';
 import { requestLogger } from './middleware/request-logger.js';
+import { requestIdMiddleware } from './middleware/request-id.js';
+import { apiVersionMiddleware } from './middleware/api-version.js';
 import { generateServerIdentityKeypair } from './crypto/utils.js';
 import { securityHeaders } from './middleware/security-headers.js';
 import { startTTLCleanupJob } from './jobs/ttl-cleanup.js';
 import { getMetrics } from './routes/metrics.js';
 import adminRouter, { setDatabase } from './routes/admin.js';
 import pairingRouter, { setDatabase as setPairingDatabase } from './routes/pairing.js';
-import statusRouter, { setSessionsMap } from './routes/status.js';
-import devicesRouter, { setDatabase as setDevicesDatabase, setSessionsMap as setDevicesSessionsMap } from './routes/devices.js';
+import statusRouter, {
+  setSessionsMap as setStatusSessionsMap,
+  setDatabase as setStatusDatabase,
+} from './routes/status.js';
+import devicesRouter, {
+  setDatabase as setDevicesDatabase,
+  setSessionsMap as setDevicesSessionsMap,
+} from './routes/devices.js';
+import authRouter, { setDatabase as setAuthDatabase } from './routes/auth.js';
+import userRouter, {
+  setDatabase as setUserDatabase,
+  setSessionsMap as setUserSessionsMap,
+} from './routes/user.js';
 
 const app = express();
 
@@ -41,10 +70,12 @@ const app = express();
 app.set('trust proxy', 1);
 
 // Security middleware
-app.use(helmet({
-  contentSecurityPolicy: false, // WebSocket needs this disabled
-  crossOriginEmbedderPolicy: false,
-}));
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // WebSocket needs this disabled
+    crossOriginEmbedderPolicy: false,
+  })
+);
 
 // CORS - Must be before other middleware
 // Build dynamic CORS options with whitelist + sensible defaults
@@ -52,9 +83,7 @@ const allowedOrigins = Array.isArray(config.cors.origin)
   ? (config.cors.origin as string[])
   : [config.cors.origin as string];
 // Normalize to avoid trailing-slash mismatches
-const normalizedAllowedOrigins = allowedOrigins
-  .filter(Boolean)
-  .map((o) => o.replace(/\/+$/, ''));
+const normalizedAllowedOrigins = allowedOrigins.filter(Boolean).map(o => o.replace(/\/+$/, ''));
 
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
@@ -65,7 +94,8 @@ const corsOptions: cors.CorsOptions = {
     // If wildcard configured, allow all origins (credentials should be false when using '*')
     if (allowedOrigins.includes('*')) return callback(null, true);
     // Exact match against whitelist
-    if (normalizedAllowedOrigins.includes((origin || '').replace(/\/+$/, ''))) return callback(null, true);
+    if (normalizedAllowedOrigins.includes((origin || '').replace(/\/+$/, '')))
+      return callback(null, true);
     // Attempt relaxed host-only matching (handles trailing slashes/protocol differences)
     try {
       const o = new URL(origin);
@@ -100,65 +130,105 @@ app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Request ID middleware (must be before request logger)
+app.use(requestIdMiddleware);
+
+// API versioning middleware
+app.use(apiVersionMiddleware);
+
 // Request logging
 app.use(requestLogger);
 
-// Rate limiting (DISABLED FOR TESTING)
-// const limiter = rateLimit({
-//   windowMs: config.rateLimit.windowMs,
-//   max: config.rateLimit.maxRequests,
-//   message: 'Too many requests from this IP, please try again later.',
-//   standardHeaders: true,
-//   legacyHeaders: false,
-// });
-// app.use('/api', limiter);
+// Rate limiting - ENABLED for production
+// Skip rate limiting in test environment
+const shouldEnableRateLimit = config.nodeEnv !== 'test';
+if (shouldEnableRateLimit) {
+  const limiter = rateLimit({
+    windowMs: config.rateLimit.windowMs,
+    max: config.rateLimit.maxRequests,
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: req => {
+      // Skip rate limiting for health checks and metrics
+      return req.path === '/health' || req.path === '/metrics';
+    },
+  });
+  app.use('/api', limiter);
+  logger.info('Rate limiting enabled', {
+    windowMs: config.rateLimit.windowMs,
+    maxRequests: config.rateLimit.maxRequests,
+  });
+} else {
+  logger.info('Rate limiting disabled (test environment)');
+}
 
 // Security headers
 app.use(securityHeaders);
 
-// Lightweight user context from header (temporary until auth is added)
-app.use((req, _res, next) => {
-  const userId = req.get('X-User-ID') || (req.query.userId as string | undefined);
-  if (userId) {
-    (req as any).userId = userId;
-  }
-  next();
-});
+// REST API authentication middleware (JWT with X-User-ID fallback)
+import { jwtAuthMiddleware } from './middleware/jwt-auth.js';
+app.use('/api', jwtAuthMiddleware);
 
-// Health check endpoint (no rate limiting)
+// Health check endpoint (no rate limiting, no auth)
+// This endpoint is used by load balancers and monitoring systems
 app.get('/health', async (req, res) => {
-  const dbHealthy = db ? await db.healthCheck() : false;
-  const redisHealthy = redis ? await redis.healthCheck() : false;
+  try {
+    const dbHealthy = db ? await db.healthCheck() : false;
+    const redisHealthy = redis ? await redis.healthCheck() : false;
 
-  const status = dbHealthy && redisHealthy ? 'ok' : 'degraded';
-  const statusCode = status === 'ok' ? 200 : 503;
+    const status = dbHealthy && redisHealthy ? 'ok' : 'degraded';
+    const statusCode = status === 'ok' ? 200 : 503;
 
-  res.status(statusCode).json({
-    status,
-    timestamp: Date.now(),
-    uptime: process.uptime(),
-    services: {
-      database: dbHealthy,
-      redis: redisHealthy,
-    },
-    version: process.env.npm_package_version || '1.0.0',
-  });
+    // Add retry-after header if degraded
+    if (status === 'degraded') {
+      res.setHeader('Retry-After', '30');
+    }
+
+    res.status(statusCode).json({
+      status,
+      timestamp: Date.now(),
+      uptime: process.uptime(),
+      services: {
+        database: dbHealthy ? 'connected' : 'disconnected',
+        redis: redisHealthy ? 'connected' : 'disconnected',
+      },
+      version: process.env.npm_package_version || '1.0.0',
+    });
+  } catch (error) {
+    logger.error(
+      'Health check failed',
+      {},
+      error instanceof Error ? error : new Error(String(error))
+    );
+    res.status(503).json({
+      status: 'error',
+      timestamp: Date.now(),
+      error: 'Health check failed',
+    });
+  }
 });
 
 // Metrics endpoint
 app.get('/metrics', getMetrics);
 
-// Admin routes (add authentication in production!)
+// Admin routes (protected with authentication)
 app.use('/admin', adminRouter);
 
-// Pairing routes
+// API routes with versioning
+// Version can be specified in path (/api/v1/...) or header (X-API-Version: v1)
+app.use('/api/v1/auth', authRouter);
+app.use('/api/v1/pairing', pairingRouter);
+app.use('/api/v1', statusRouter);
+app.use('/api/v1', devicesRouter);
+app.use('/api/v1', userRouter);
+
+// Backward compatibility: also support /api/... (defaults to v1)
+app.use('/api/auth', authRouter);
 app.use('/api/pairing', pairingRouter);
-
-// Status routes
 app.use('/api', statusRouter);
-
-// Devices routes
 app.use('/api', devicesRouter);
+app.use('/api', userRouter);
 
 // 404 handler
 app.use((req, res) => {
@@ -175,7 +245,7 @@ app.use(errorHandler);
 const server = createServer(app);
 
 // WebSocket server
-const wss = new WebSocketServer({ 
+const wss = new WebSocketServer({
   server,
   path: '/ws',
   perMessageDeflate: false, // Disable compression (security: CRIME attack)
@@ -210,7 +280,9 @@ async function start() {
       logger.warn('⚠️  Generated new server identity. Save these keys securely!');
       logger.warn(`Public Key (hex): ${newKeys.publicKeyHex}`);
       logger.warn(`Private Key (hex): ${newKeys.privateKeyHex}`);
-      logger.warn('Set SERVER_PUBLIC_KEY_HEX and SERVER_PRIVATE_KEY_HEX environment variables in production!');
+      logger.warn(
+        'Set SERVER_PUBLIC_KEY_HEX and SERVER_PRIVATE_KEY_HEX environment variables in production!'
+      );
     } else {
       // Convert PEM keys to hex if needed, or use hex directly
       if (serverIdentity.publicKey && !serverIdentity.publicKeyHex) {
@@ -225,10 +297,15 @@ async function start() {
     // Initialize database
     db = await initDatabase();
     logger.info('PostgreSQL connected');
-    
+
+    // Run migrations
+    const { runMigrations } = await import('./db/migrations.js');
+    await runMigrations(db);
+    logger.info('Database migrations completed');
+
     // Set database for admin routes
     setDatabase(db);
-    
+
     // Set database for pairing routes
     setPairingDatabase(db);
 
@@ -241,13 +318,20 @@ async function start() {
 
     // Create WebSocket gateway
     const sessions = createWebSocketGateway(wss, { db, redis });
-    setSessionsMap(sessions);
     setDevicesSessionsMap(sessions);
+    setUserSessionsMap(sessions);
+    setStatusSessionsMap(sessions);
+    setStatusDatabase(db);
     logger.info('WebSocket gateway ready');
 
     // Start TTL cleanup job
     startTTLCleanupJob(db, 3600000); // Every hour
     logger.info('TTL cleanup job started');
+
+    // Start data retention job
+    const { startDataRetentionJob } = await import('./jobs/data-retention.js');
+    startDataRetentionJob(db, 24 * 60 * 60 * 1000); // Daily
+    logger.info('Data retention job started');
 
     // Handle server listen errors (MUST be set up BEFORE server.listen())
     server.on('error', (error: NodeJS.ErrnoException) => {
@@ -256,16 +340,22 @@ async function start() {
           port: config.port,
           code: error.code,
         });
-        logger.error('Please stop the process using this port or change the PORT environment variable');
+        logger.error(
+          'Please stop the process using this port or change the PORT environment variable'
+        );
         console.error(`\n❌ Port ${config.port} is already in use!\n`);
         console.error('To fix this, run:');
         console.error(`  netstat -ano | grep ":${config.port}" | grep LISTENING`);
         console.error('  Then kill the process using: taskkill //F //PID <PID>\n');
       } else {
-        logger.error('Server error', {
-          code: error.code,
-          message: error.message,
-        }, error);
+        logger.error(
+          'Server error',
+          {
+            code: error.code,
+            message: error.message,
+          },
+          error
+        );
       }
       gracefulShutdown('server_error');
     });
@@ -279,36 +369,47 @@ async function start() {
     });
 
     // Handle uncaught errors
-    process.on('uncaughtException', (error) => {
-      logger.error('Uncaught exception', {
-        name: error.name,
-        message: error.message,
-        stack: error.stack,
-        code: (error as any).code,
-      }, error);
+    process.on('uncaughtException', error => {
+      logger.error(
+        'Uncaught exception',
+        {
+          name: error.name,
+          message: error.message,
+          stack: error.stack,
+          code: (error as any).code,
+        },
+        error
+      );
       console.error('Uncaught Exception Details:', error);
       gracefulShutdown('uncaughtException');
     });
 
     process.on('unhandledRejection', (reason, promise) => {
       const error = reason instanceof Error ? reason : new Error(String(reason));
-      logger.error('Unhandled rejection', {
-        promise: promise.toString(),
-        name: error.name,
-        message: error.message,
-        stack: error.stack,
-      }, error);
+      logger.error(
+        'Unhandled rejection',
+        {
+          promise: promise.toString(),
+          name: error.name,
+          message: error.message,
+          stack: error.stack,
+        },
+        error
+      );
       console.error('Unhandled Rejection Details:', reason);
       gracefulShutdown('unhandledRejection');
     });
-
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
-    logger.error('Failed to start server', {
-      message: err.message,
-      stack: err.stack,
-      name: err.name,
-    }, err);
+    logger.error(
+      'Failed to start server',
+      {
+        message: err.message,
+        stack: err.stack,
+        name: err.name,
+      },
+      err
+    );
     console.error('Startup Error Details:', {
       message: err.message,
       stack: err.stack,
@@ -319,7 +420,8 @@ async function start() {
 }
 
 /**
- * Graceful shutdown
+ * Graceful shutdown with proper cleanup
+ * Waits for in-flight requests and closes connections gracefully
  */
 async function gracefulShutdown(signal: string): Promise<void> {
   if (isShuttingDown) {
@@ -330,39 +432,80 @@ async function gracefulShutdown(signal: string): Promise<void> {
   isShuttingDown = true;
   logger.info(`Received ${signal}, shutting down gracefully...`);
 
-  // Stop accepting new connections
-  server.close(async () => {
-    logger.info('HTTP server closed');
-
-    // Close database connections
-    if (db) {
-      try {
-        await db.end();
-        logger.info('Database connections closed');
-      } catch (error) {
-        logger.error('Error closing database', {}, error instanceof Error ? error : new Error(String(error)));
-      }
-    }
-
-    // Close Redis connections
-    if (redis) {
-      try {
-        await redis.quit();
-        logger.info('Redis connections closed');
-      } catch (error) {
-        logger.error('Error closing Redis', {}, error instanceof Error ? error : new Error(String(error)));
-      }
-    }
-
-    logger.info('Graceful shutdown complete');
-    process.exit(0);
+  // Stop accepting new connections immediately
+  server.close(() => {
+    logger.info('HTTP server stopped accepting new connections');
   });
 
-  // Force shutdown after 30 seconds
-  setTimeout(() => {
-    logger.error('Forced shutdown after timeout');
-    process.exit(1);
-  }, 30000);
+  // Close all WebSocket connections gracefully
+  wss.clients.forEach(ws => {
+    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
+      ws.close(1001, 'Server shutting down');
+    }
+  });
+
+  // Wait for in-flight requests to complete (with timeout)
+  const shutdownTimeout = 30000; // 30 seconds
+  const shutdownStart = Date.now();
+
+  const waitForInFlight = async (): Promise<void> => {
+    // Wait for WebSocket connections to close
+    while (wss.clients.size > 0 && Date.now() - shutdownStart < shutdownTimeout) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    // Additional small delay for any final cleanup
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  };
+
+  try {
+    await Promise.race([
+      waitForInFlight(),
+      new Promise<void>(resolve => {
+        setTimeout(() => {
+          logger.warn('Shutdown timeout reached, forcing closure');
+          resolve();
+        }, shutdownTimeout);
+      }),
+    ]);
+  } catch (error) {
+    logger.error(
+      'Error during shutdown wait',
+      {},
+      error instanceof Error ? error : new Error(String(error))
+    );
+  }
+
+  // Close database connections
+  if (db) {
+    try {
+      await db.end();
+      logger.info('Database connections closed');
+    } catch (error) {
+      logger.error(
+        'Error closing database',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+
+  // Close Redis connections
+  if (redis) {
+    try {
+      await redis.quit();
+      logger.info('Redis connections closed');
+    } catch (error) {
+      logger.error(
+        'Error closing Redis',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+
+  logger.info('Graceful shutdown complete');
+  process.exit(0);
 }
 
 // Handle shutdown signals

@@ -1,11 +1,16 @@
 /**
  * Handshake Handler
- * 
+ *
  * Implements MTProto-inspired handshake protocol:
  * 1. Client Hello (ephemeral ECDH + nonce)
  * 2. Server Hello (ephemeral ECDH + server signature + nonce)
  * 3. Client Auth (user_id + device_id + client signature)
  * 4. Session Established (confirmation + replay state)
+ *
+ * Thread Safety:
+ * - Uses message queue per connection to serialize handshake messages
+ * - State transitions are atomic and guarded
+ * - Prevents concurrent processing of handshake messages
  */
 
 import { WebSocket } from 'ws';
@@ -23,8 +28,15 @@ import {
   hashForSignature,
 } from '../crypto/utils.js';
 import { logger } from '../utils/logger.js';
-import type { ClientHello, ServerHello, ClientAuth, SessionEstablished, WSMessage } from '../types/index.js';
+import type {
+  ClientHello,
+  ServerHello,
+  ClientAuth,
+  SessionEstablished,
+  WSMessage,
+} from '../types/index.js';
 import type { ServerIdentityKeypair } from '../crypto/utils.js';
+import { isDeviceRevoked } from '../services/device-revocation.js';
 
 interface HandshakeState {
   step: 'client_hello' | 'server_hello' | 'client_auth';
@@ -35,21 +47,32 @@ interface HandshakeState {
   nonceC2?: string;
   sharedSecret?: Buffer;
   sessionKeys?: ReturnType<typeof deriveSessionKeys>;
+  processing?: boolean; // Guard flag to prevent concurrent processing
 }
-
 
 // Store handshake state per WebSocket connection
 const handshakeStates = new WeakMap<WebSocket, HandshakeState>();
 
+// Message queue per connection to serialize handshake processing
+const messageQueues = new WeakMap<
+  WebSocket,
+  Array<{
+    message: unknown;
+    resolve: (result: HandshakeResult) => void;
+    reject: (error: Error) => void;
+  }>
+>();
+
 // Helper to reset handshake state on error (must be top-level for all usages)
 function resetHandshakeStateOnError(ws: WebSocket, reason: string) {
   handshakeStates.delete(ws);
+  messageQueues.delete(ws);
 }
 
 // Attach WebSocket close handler to reset handshake state
 export function attachHandshakeCleanup(ws: WebSocket) {
   ws.on('close', () => {
-    handshakeStates.delete(ws);
+    resetHandshakeStateOnError(ws, 'connection_closed');
   });
 }
 
@@ -61,7 +84,8 @@ interface HandshakeResult {
 }
 
 /**
- * Handle handshake message
+ * Handle handshake message with serialization to prevent race conditions
+ * Messages are queued and processed one at a time per connection
  */
 export async function handleHandshake(
   message: unknown,
@@ -69,49 +93,136 @@ export async function handleHandshake(
   db: Database,
   serverIdentity: ServerIdentityKeypair
 ): Promise<HandshakeResult> {
-  // Get or create handshake state
-  let state = handshakeStates.get(ws);
   // Ensure cleanup is attached (idempotent)
   if (!(ws as any)._handshakeCleanupAttached) {
     attachHandshakeCleanup(ws);
     (ws as any)._handshakeCleanupAttached = true;
   }
+
+  // Get or create message queue for this connection
+  let queue = messageQueues.get(ws);
+  if (!queue) {
+    queue = [];
+    messageQueues.set(ws, queue);
+  }
+
+  // Create promise for this message
+  return new Promise<HandshakeResult>((resolve, reject) => {
+    queue!.push({ message, resolve, reject });
+
+    // Process queue if not already processing
+    processHandshakeQueue(ws, db, serverIdentity).catch(reject);
+  });
+}
+
+/**
+ * Process handshake message queue serially (one at a time per connection)
+ */
+async function processHandshakeQueue(
+  ws: WebSocket,
+  db: Database,
+  serverIdentity: ServerIdentityKeypair
+): Promise<void> {
+  const queue = messageQueues.get(ws);
+  if (!queue || queue.length === 0) {
+    return;
+  }
+
+  // Get or create handshake state
+  let state = handshakeStates.get(ws);
   if (!state) {
-    state = { step: 'client_hello' };
+    state = { step: 'client_hello', processing: false };
     handshakeStates.set(ws, state);
   }
 
-
-  // Validate message structure
-  if (typeof message !== 'object' || message === null) {
-    logger.warn('Invalid message format in handshake', { message });
-    resetHandshakeStateOnError(ws, 'invalid_message_format');
-    return { success: false, error: 'Invalid message format' };
+  // If already processing, wait for current message to complete
+  if (state.processing) {
+    return; // Queue will be processed when current message completes
   }
 
-  const msg = message as Record<string, unknown>;
+  // Mark as processing to prevent concurrent execution
+  state.processing = true;
 
-  // Handle Client Hello
-  if (msg.type === 'client_hello' && state.step === 'client_hello') {
-    return handleClientHello(msg as unknown as ClientHello, ws, state, serverIdentity);
+  try {
+    while (queue.length > 0) {
+      const { message, resolve, reject } = queue.shift()!;
+
+      try {
+        // Validate message structure
+        if (typeof message !== 'object' || message === null) {
+          logger.warn('Invalid message format in handshake', { message });
+          resetHandshakeStateOnError(ws, 'invalid_message_format');
+          resolve({ success: false, error: 'Invalid message format' });
+          continue;
+        }
+
+        const msg = message as Record<string, unknown>;
+        const currentState = handshakeStates.get(ws);
+
+        // Re-check state after potential concurrent modifications
+        if (!currentState) {
+          resolve({ success: false, error: 'Handshake state lost' });
+          continue;
+        }
+
+        let result: HandshakeResult;
+
+        // Handle Client Hello
+        if (msg.type === 'client_hello' && currentState.step === 'client_hello') {
+          result = await handleClientHello(
+            msg as unknown as ClientHello,
+            ws,
+            currentState,
+            serverIdentity
+          );
+        }
+        // Handle Client Auth
+        else if (msg.type === 'client_auth' && currentState.step === 'server_hello') {
+          result = await handleClientAuth(
+            msg as unknown as ClientAuth,
+            ws,
+            currentState,
+            db,
+            serverIdentity
+          );
+        }
+        // Invalid handshake step
+        else {
+          logger.warn('Invalid handshake step', {
+            messageType: msg.type,
+            currentStep: currentState.step,
+            expectedStepForClientHello: 'client_hello',
+            expectedStepForClientAuth: 'server_hello',
+            stateKeys: Object.keys(currentState),
+          });
+          resetHandshakeStateOnError(ws, 'invalid_handshake_step');
+          result = {
+            success: false,
+            error: `Invalid handshake step: expected ${msg.type === 'client_auth' ? 'server_hello' : 'client_hello'}, got ${currentState.step}`,
+          };
+        }
+
+        resolve(result);
+
+        // If handshake completed (session established), stop processing queue
+        if (result.success && result.sessionState) {
+          state.processing = false;
+          messageQueues.delete(ws);
+          return;
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.error('Error processing handshake message', { error: errorMessage });
+        reject(error instanceof Error ? error : new Error(errorMessage));
+      }
+    }
+  } finally {
+    // Clear processing flag
+    const finalState = handshakeStates.get(ws);
+    if (finalState) {
+      finalState.processing = false;
+    }
   }
-
-  // Handle Client Auth
-  if (msg.type === 'client_auth' && state.step === 'server_hello') {
-    return handleClientAuth(msg as unknown as ClientAuth, ws, state, db, serverIdentity);
-  }
-
-  // Log why handshake step is invalid
-  logger.warn('Invalid handshake step', {
-    messageType: msg.type,
-    currentStep: state.step,
-    expectedStepForClientHello: 'client_hello',
-    expectedStepForClientAuth: 'server_hello',
-    stateKeys: Object.keys(state),
-  });
-
-  resetHandshakeStateOnError(ws, 'invalid_handshake_step');
-  return { success: false, error: `Invalid handshake step: expected ${msg.type === 'client_auth' ? 'server_hello' : 'client_hello'}, got ${state.step}` };
 }
 
 /**
@@ -128,6 +239,12 @@ async function handleClientHello(
     if (!validateNonce(message.nonce_c)) {
       resetHandshakeStateOnError(ws, 'invalid_nonce_format');
       return { success: false, error: 'Invalid nonce format' };
+    }
+
+    // Validate we're in the correct state (double-check after queue processing)
+    if (state.step !== 'client_hello') {
+      logger.warn('handleClientHello: Invalid state', { currentStep: state.step });
+      return { success: false, error: `Invalid state: expected client_hello, got ${state.step}` };
     }
 
     // Generate server ephemeral keypair
@@ -161,10 +278,10 @@ async function handleClientHello(
       logger.error('handleClientHello: Server private key not configured');
       return { success: false, error: 'Server private key not configured' };
     }
-    
+
     const serverSignature = await signEd25519(privateKeyHex, signatureData);
 
-    // Update state
+    // Atomically update state (all fields at once to prevent partial updates)
     state.step = 'server_hello';
     state.clientEphemeralPub = message.client_ephemeral_pub;
     state.serverEphemeralKeypair = serverEphemeralKeypair;
@@ -181,27 +298,40 @@ async function handleClientHello(
       server_signature: serverSignature,
       nonce_s: nonceS,
     };
-    
+
+    const response: WSMessage = {
+      type: 'server_hello',
+      payload: serverHello,
+    };
+
     try {
-      ws.send(JSON.stringify({
-        type: 'server_hello',
-        payload: serverHello,
-      }));
+      ws.send(JSON.stringify(response));
     } catch (sendError) {
-      logger.error('handleClientHello: Failed to send server_hello', {}, sendError instanceof Error ? sendError : new Error(String(sendError)));
+      logger.error(
+        'handleClientHello: Failed to send server_hello',
+        {},
+        sendError instanceof Error ? sendError : new Error(String(sendError))
+      );
       resetHandshakeStateOnError(ws, 'failed_to_send_server_hello');
-      return { success: false, error: `Failed to send server_hello: ${sendError instanceof Error ? sendError.message : String(sendError)}` };
+      return {
+        success: false,
+        error: `Failed to send server_hello: ${sendError instanceof Error ? sendError.message : String(sendError)}`,
+      };
     }
 
-    return { success: true };
+    return { success: true, response };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
-    logger.error('handleClientHello: Exception occurred', {
-      error: errorMessage,
-      errorType: error instanceof Error ? error.constructor.name : typeof error,
-      hasStack: !!errorStack,
-    }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'handleClientHello: Exception occurred',
+      {
+        error: errorMessage,
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+        hasStack: !!errorStack,
+      },
+      error instanceof Error ? error : new Error(String(error))
+    );
     return { success: false, error: `handleClientHello failed: ${errorMessage}` };
   }
 }
@@ -216,6 +346,12 @@ async function handleClientAuth(
   db: Database,
   serverIdentity: ServerIdentityKeypair
 ): Promise<HandshakeResult> {
+  // Validate we're in the correct state (double-check after queue processing)
+  if (state.step !== 'server_hello') {
+    logger.warn('handleClientAuth: Invalid state', { currentStep: state.step });
+    return { success: false, error: `Invalid state: expected server_hello, got ${state.step}` };
+  }
+
   if (!state.nonceC || !state.nonceS || !state.serverEphemeralKeypair) {
     return { success: false, error: 'Handshake state incomplete' };
   }
@@ -230,7 +366,7 @@ async function handleClientAuth(
   // IMPORTANT: The client uses the server_ephemeral_pub from the server_hello message (hex string)
   // We need to use the same value that was sent to the client
   const serverEphemeralPubHex = state.serverEphemeralKeypair.publicKey;
-  
+
   // Log the exact values being hashed for debugging
   // Show only keys for debug
   logger.info(`[KEYS] user_id: ${message.user_id}`);
@@ -238,7 +374,7 @@ async function handleClientAuth(
   logger.info(`[KEYS] nonceC: ${state.nonceC}`);
   logger.info(`[KEYS] nonceS: ${state.nonceS}`);
   logger.info(`[KEYS] serverEphemeralPub: ${serverEphemeralPubHex}`);
-  
+
   // Hash the signature data in the same order as the client
   const signatureData = hashForSignature(
     message.user_id,
@@ -247,26 +383,34 @@ async function handleClientAuth(
     state.nonceS,
     serverEphemeralPubHex
   );
-  
+
   // Log the computed hash for comparison with client (use INFO level so it's visible)
   const signatureDataHex = Buffer.from(signatureData).toString('hex');
   logger.info(`[KEYS] signatureDataHash: ${signatureDataHex}`);
 
   // Verify signature using hex format (user_id is Ed25519 public key in hex)
   const publicKeyHex = message.user_id;
-  if (publicKeyHex.length !== 64) { // 32 bytes = 64 hex chars
+  if (publicKeyHex.length !== 64) {
+    // 32 bytes = 64 hex chars
     resetHandshakeStateOnError(ws, 'invalid_public_key_length');
     return { success: false, error: 'Invalid public key length' };
+  }
+
+  // Check if device is revoked before completing handshake (security)
+  const revoked = await isDeviceRevoked(db, message.device_id);
+  if (revoked) {
+    logger.warn('Revoked device attempted handshake', {
+      deviceId: message.device_id,
+      userId: message.user_id.substring(0, 16) + '...',
+    });
+    resetHandshakeStateOnError(ws, 'device_revoked');
+    return { success: false, error: 'Device has been revoked' };
   }
 
   // Verify signature using tweetnacl-compatible hex format
   logger.info(`[KEYS] clientSignature: ${message.client_signature}`);
 
-  const isValid = await verifyEd25519(
-    publicKeyHex,
-    signatureData,
-    message.client_signature
-  );
+  const isValid = await verifyEd25519(publicKeyHex, signatureData, message.client_signature);
 
   if (!isValid) {
     // No log except keys
@@ -275,10 +419,9 @@ async function handleClientAuth(
   }
 
   // Get or create user
-  await db.pool.query(
-    'INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
-    [message.user_id]
-  );
+  await db.pool.query('INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING', [
+    message.user_id,
+  ]);
 
   // Get or create device in multi-schema and get last_ack_device_seq
   const deviceResult = await db.pool.query(
@@ -317,11 +460,15 @@ async function handleClientAuth(
     type: 'session_established',
     payload: sessionEstablished,
   };
-  
+
   try {
     ws.send(JSON.stringify(sessionEstablishedMessage));
   } catch (error) {
-    logger.error('Failed to send session_established message', {}, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to send session_established message',
+      {},
+      error instanceof Error ? error : new Error(String(error))
+    );
     throw error;
   }
 

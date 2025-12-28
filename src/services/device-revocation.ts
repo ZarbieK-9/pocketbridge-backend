@@ -1,6 +1,6 @@
 /**
  * Device Revocation Service
- * 
+ *
  * Manages device blacklist for compromised devices
  */
 
@@ -11,10 +11,7 @@ import { auditLog, AuditEventType } from '../utils/audit-log.js';
 /**
  * Check if device is revoked
  */
-export async function isDeviceRevoked(
-  db: Database,
-  deviceId: string
-): Promise<boolean> {
+export async function isDeviceRevoked(db: Database, deviceId: string): Promise<boolean> {
   try {
     const result = await db.pool.query(
       'SELECT device_id FROM revoked_devices WHERE device_id = $1',
@@ -22,7 +19,11 @@ export async function isDeviceRevoked(
     );
     return result.rows.length > 0;
   } catch (error) {
-    logger.error('Failed to check device revocation', { deviceId }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to check device revocation',
+      { deviceId },
+      error instanceof Error ? error : new Error(String(error))
+    );
     // Fail open - if we can't check, allow connection (but log it)
     return false;
   }
@@ -55,7 +56,11 @@ export async function revokeDevice(
 
     logger.info('Device revoked', { deviceId, userId, reason });
   } catch (error) {
-    logger.error('Failed to revoke device', { deviceId, userId }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to revoke device',
+      { deviceId, userId },
+      error instanceof Error ? error : new Error(String(error))
+    );
     throw error;
   }
 }
@@ -63,19 +68,17 @@ export async function revokeDevice(
 /**
  * Unrevoke a device (restore access)
  */
-export async function unrevokeDevice(
-  db: Database,
-  deviceId: string
-): Promise<void> {
+export async function unrevokeDevice(db: Database, deviceId: string): Promise<void> {
   try {
-    await db.pool.query(
-      'DELETE FROM revoked_devices WHERE device_id = $1',
-      [deviceId]
-    );
+    await db.pool.query('DELETE FROM revoked_devices WHERE device_id = $1', [deviceId]);
 
     logger.info('Device unrevoked', { deviceId });
   } catch (error) {
-    logger.error('Failed to unrevoke device', { deviceId }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to unrevoke device',
+      { deviceId },
+      error instanceof Error ? error : new Error(String(error))
+    );
     throw error;
   }
 }
@@ -99,22 +102,11 @@ export async function getRevokedDevices(
       reason: row.reason,
     }));
   } catch (error) {
-    logger.error('Failed to get revoked devices', { userId }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to get revoked devices',
+      { userId },
+      error instanceof Error ? error : new Error(String(error))
+    );
     return [];
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

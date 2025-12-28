@@ -1,6 +1,6 @@
 /**
  * Error handling utilities
- * 
+ *
  * Custom error classes and error response formatting
  */
 
@@ -58,9 +58,7 @@ export function formatErrorResponse(error: unknown): {
 
   if (error instanceof PocketBridgeError) {
     return {
-      error: isProduction && error.statusCode >= 500
-        ? 'An internal error occurred'
-        : error.message,
+      error: isProduction && error.statusCode >= 500 ? 'An internal error occurred' : error.message,
       code: error.code,
       statusCode: error.statusCode,
       context: isProduction ? undefined : error.context,
@@ -69,9 +67,7 @@ export function formatErrorResponse(error: unknown): {
 
   if (error instanceof Error) {
     return {
-      error: isProduction
-        ? 'An internal error occurred'
-        : error.message,
+      error: isProduction ? 'An internal error occurred' : error.message,
       code: 'INTERNAL_ERROR',
       statusCode: 500,
     };
@@ -89,6 +85,7 @@ export function formatErrorResponse(error: unknown): {
  */
 import { Request, Response, NextFunction } from 'express';
 import { logger } from './logger.js';
+import type { ErrorContext } from './error-context.js';
 
 export function errorHandler(
   error: unknown,
@@ -98,6 +95,8 @@ export function errorHandler(
 ): void {
   const errorResponse = formatErrorResponse(error);
 
+  // Log full error details (including stack) for debugging, but don't expose in response
+  const isProduction = process.env.NODE_ENV === 'production';
   logger.error('Request error', {
     method: req.method,
     path: req.path,
@@ -105,8 +104,17 @@ export function errorHandler(
     code: errorResponse.code,
     statusCode: errorResponse.statusCode,
     context: errorResponse.context,
+    // Include full error details in logs (not in response)
+    fullError: isProduction
+      ? undefined
+      : error instanceof Error
+        ? {
+            message: error.message,
+            stack: error.stack,
+            name: error.name,
+          }
+        : String(error),
   });
 
   res.status(errorResponse.statusCode).json(errorResponse);
 }
-

@@ -1,6 +1,6 @@
 /**
  * Pairing Code Routes
- * 
+ *
  * Handles pairing code generation and lookup
  * Pairing codes are temporary (expire after 10 minutes)
  */
@@ -30,8 +30,16 @@ router.post('/store', async (req: Request, res: Response) => {
       throw new ValidationError('code and data are required');
     }
 
-    if (!data.wsUrl || !data.userId || !data.deviceId || !data.publicKeyHex || !data.privateKeyHex) {
-      throw new ValidationError('wsUrl, userId, deviceId, publicKeyHex, and privateKeyHex are required');
+    if (
+      !data.wsUrl ||
+      !data.userId ||
+      !data.deviceId ||
+      !data.publicKeyHex ||
+      !data.privateKeyHex
+    ) {
+      throw new ValidationError(
+        'wsUrl, userId, deviceId, publicKeyHex, and privateKeyHex are required'
+      );
     }
 
     if (!dbInstance) {
@@ -42,27 +50,44 @@ router.post('/store', async (req: Request, res: Response) => {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     // Delete any existing pairing codes for this user/device to prevent duplicates
-    await dbInstance.pool.query(
-      `DELETE FROM pairing_codes WHERE user_id = $1 AND device_id = $2`,
-      [data.userId, data.deviceId]
-    );
+    await dbInstance.pool.query(`DELETE FROM pairing_codes WHERE user_id = $1 AND device_id = $2`, [
+      data.userId,
+      data.deviceId,
+    ]);
 
     await dbInstance.pool.query(
       `INSERT INTO pairing_codes (code, ws_url, user_id, device_id, device_name, public_key_hex, private_key_hex, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [code, data.wsUrl, data.userId, data.deviceId, data.deviceName || 'Device', data.publicKeyHex, data.privateKeyHex, expiresAt]
+      [
+        code,
+        data.wsUrl,
+        data.userId,
+        data.deviceId,
+        data.deviceName || 'Device',
+        data.publicKeyHex,
+        data.privateKeyHex,
+        expiresAt,
+      ]
     );
 
-    logger.info('Pairing code stored', { code, userId: data.userId.substring(0, 16) + '...', expiresAt });
+    logger.info('Pairing code stored', {
+      code,
+      userId: data.userId.substring(0, 16) + '...',
+      expiresAt,
+    });
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: 'Pairing code stored',
       expiresAt: expiresAt.toISOString(),
       expiresIn: 10 * 60 * 1000, // 10 minutes in milliseconds
     });
   } catch (error) {
-    logger.error('Failed to store pairing code', { body: req.body }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to store pairing code',
+      { body: req.body },
+      error instanceof Error ? error : new Error(String(error))
+    );
     if (error instanceof ValidationError) {
       res.status(400).json({ error: error.message });
     } else {
@@ -104,12 +129,12 @@ router.get('/lookup/:code', async (req: Request, res: Response) => {
     const row = result.rows[0];
 
     // Delete the code after retrieval (one-time use)
-    await dbInstance.pool.query(
-      'DELETE FROM pairing_codes WHERE code = $1',
-      [code]
-    );
+    await dbInstance.pool.query('DELETE FROM pairing_codes WHERE code = $1', [code]);
 
-    logger.info('Pairing code retrieved and deleted', { code, userId: row.user_id.substring(0, 16) + '...' });
+    logger.info('Pairing code retrieved and deleted', {
+      code,
+      userId: row.user_id.substring(0, 16) + '...',
+    });
 
     res.json({
       success: true,
@@ -123,7 +148,11 @@ router.get('/lookup/:code', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    logger.error('Failed to lookup pairing code', { code: req.params.code }, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to lookup pairing code',
+      { code: req.params.code },
+      error instanceof Error ? error : new Error(String(error))
+    );
     if (error instanceof ValidationError) {
       res.status(400).json({ error: error.message });
     } else {
@@ -133,4 +162,3 @@ router.get('/lookup/:code', async (req: Request, res: Response) => {
 });
 
 export default router;
-

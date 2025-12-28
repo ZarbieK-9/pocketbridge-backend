@@ -1,6 +1,6 @@
 /**
  * Request logging middleware
- * 
+ *
  * Logs all HTTP requests with structured logging
  */
 
@@ -26,7 +26,11 @@ export const requestLogger = pinoHttp({
     return {
       ip: req.ip || req.socket.remoteAddress,
       userAgent: req.get('user-agent'),
+      requestId: (req as any).requestId,
+      apiVersion: (req as any).apiVersion,
+      userId: (req as any).userId
+        ? ((req as any).userId as string).substring(0, 16) + '...'
+        : undefined,
     };
   },
 });
-

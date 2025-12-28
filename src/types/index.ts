@@ -79,19 +79,25 @@ export interface SessionState {
 }
 
 /**
- * Replay request
+ * Replay request with pagination support
  */
 export interface ReplayRequest {
   type: 'replay_request';
   last_ack_device_seq: number;
+  limit?: number; // Number of events per page (default: 100, max: 1000)
+  continuation_token?: string; // Token for pagination (base64 encoded last device_seq)
 }
 
 /**
- * Replay response
+ * Replay response with pagination
  */
 export interface ReplayResponse {
   type: 'replay_response';
   events: EncryptedEvent[];
+  has_more: boolean; // Whether more events are available
+  continuation_token?: string; // Token to request next page (if has_more is true)
+  total_events?: number; // Total number of events available (only on first page)
+  page_size: number; // Number of events in this response
 }
 
 /**
@@ -136,13 +142,3 @@ export interface SessionExpiringWarning {
   expires_in_seconds: number;
   expires_at: number; // Unix timestamp
 }
-
-
-
-
-
-
-
-
-
-

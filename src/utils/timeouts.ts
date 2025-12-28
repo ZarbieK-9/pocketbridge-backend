@@ -1,6 +1,6 @@
 /**
  * Timeout Utilities
- * 
+ *
  * Adds timeouts to async operations to prevent hanging
  */
 
@@ -14,9 +14,7 @@ export function withTimeout<T>(
 ): Promise<T> {
   return Promise.race([
     promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(errorMessage)), timeoutMs)
-    ),
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(errorMessage)), timeoutMs)),
   ]);
 }
 
@@ -27,18 +25,3 @@ export const TIMEOUTS = {
   HANDSHAKE: 30000, // 30 seconds
   EVENT_PROCESSING: 10000, // 10 seconds
 } as const;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

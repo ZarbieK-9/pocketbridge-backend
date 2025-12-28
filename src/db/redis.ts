@@ -1,11 +1,11 @@
 /**
  * Redis Connection with Production Features
- * 
+ *
  * Uses Redis ONLY for:
  * - Pub/Sub routing (fan-out events to devices)
  * - Presence tracking (device online/offline)
  * - Rate limiting (optional)
- * 
+ *
  * NEVER stores:
  * - Payloads
  * - Plaintext
@@ -15,6 +15,8 @@
 import { createClient, RedisClientType } from 'redis';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { redisCircuitBreaker } from '../services/circuit-breaker.js';
+import { incrementCounter, recordHistogram } from '../services/metrics.js';
 
 export interface RedisConnection {
   client: RedisClientType;
@@ -62,7 +64,7 @@ export async function initRedis(): Promise<RedisConnection> {
   const client = createClient(clientConfig) as RedisClientType;
 
   // Error handling
-  client.on('error', (err) => {
+  client.on('error', err => {
     logger.error('Redis client error', {}, err);
   });
 
@@ -90,7 +92,11 @@ export async function initRedis(): Promise<RedisConnection> {
     } catch (error) {
       retries--;
       if (retries === 0) {
-        logger.error('Failed to connect to Redis after retries', {}, error instanceof Error ? error : new Error(String(error)));
+        logger.error(
+          'Failed to connect to Redis after retries',
+          {},
+          error instanceof Error ? error : new Error(String(error))
+        );
         throw error;
       }
       logger.warn(`Redis connection failed, retrying in ${delay}ms... (${retries} retries left)`);
@@ -107,9 +113,21 @@ export async function initRedis(): Promise<RedisConnection> {
     },
     healthCheck: async () => {
       try {
-        await client.ping();
+        const startTime = Date.now();
+        await redisCircuitBreaker.execute(async () => {
+          await client.ping();
+        }, 'redis');
+        const duration = Date.now() - startTime;
+        recordHistogram('redis_operation_duration_ms', duration, { operation: 'ping' });
+        incrementCounter('redis_operations_total', { operation: 'ping', status: 'success' });
         return true;
-      } catch {
+      } catch (error) {
+        incrementCounter('redis_operations_total', { operation: 'ping', status: 'error' });
+        logger.error(
+          'Redis health check failed',
+          {},
+          error instanceof Error ? error : new Error(String(error))
+        );
         return false;
       }
     },

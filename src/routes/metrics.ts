@@ -1,38 +1,42 @@
 /**
  * Metrics Endpoint
- * 
+ *
  * Exposes Prometheus-compatible metrics
  */
 
 import { Request, Response } from 'express';
-import { connectionRateLimiter, eventRateLimiter, handshakeRateLimiter } from '../middleware/rate-limit.js';
+import { metrics } from '../services/metrics.js';
+import { logger } from '../utils/logger.js';
 
 /**
  * Get metrics in Prometheus format
  */
 export function getMetrics(req: Request, res: Response): void {
-  // Set content type
-  res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+  try {
+    // Set content type
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4');
 
-  const metrics: string[] = [];
+    const lines: string[] = [];
 
-  // Connection metrics (simplified - in production, use proper metrics library like prom-client)
-  // Note: Rate limiter store is private, so we can't access it directly
-  // In production, use a proper metrics library that tracks these values
-  metrics.push('# HELP pocketbridge_info Server information');
-  metrics.push('# TYPE pocketbridge_info gauge');
-  metrics.push('pocketbridge_info{version="1.0.0"} 1');
+    // Add Prometheus format headers
+    lines.push('# HELP pocketbridge_info Server information');
+    lines.push('# TYPE pocketbridge_info gauge');
+    lines.push('pocketbridge_info{version="1.0.0"} 1');
+    lines.push('');
 
-  // Rate limit metrics
-  metrics.push('# HELP pocketbridge_rate_limit_hits_total Total rate limit hits');
-  metrics.push('# TYPE pocketbridge_rate_limit_hits_total counter');
-  // Note: In production, track these properly
+    // Export all metrics
+    const exported = metrics.exportPrometheus();
+    if (exported) {
+      lines.push(exported);
+    }
 
-  // Event metrics
-  metrics.push('# HELP pocketbridge_events_total Total events processed');
-  metrics.push('# TYPE pocketbridge_events_total counter');
-  // Note: In production, track these properly
-
-  res.send(metrics.join('\n') + '\n');
+    res.send(lines.join('\n'));
+  } catch (error) {
+    logger.error(
+      'Failed to export metrics',
+      {},
+      error instanceof Error ? error : new Error(String(error))
+    );
+    res.status(500).send('# Error exporting metrics\n');
+  }
 }
-

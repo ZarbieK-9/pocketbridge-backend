@@ -1,12 +1,12 @@
 /**
  * Cryptographic Utilities
- * 
+ *
  * Server-side crypto operations:
  * - Ed25519 signature verification (client authentication)
  * - ECDH key exchange (session handshake)
  * - HKDF key derivation (session keys)
  * - Nonce generation and validation
- * 
+ *
  * NOTE: Server never decrypts payloads. This module only handles
  * authentication, key exchange, and session establishment.
  */
@@ -47,10 +47,10 @@ export async function generateServerIdentityKeypair(): Promise<ServerIdentityKey
     const privateKey = nacl.randomBytes(32);
     const kp = nacl.sign.keyPair.fromSeed(privateKey);
     const publicKey = kp.publicKey;
-    
+
     const privateKeyHex = Buffer.from(privateKey).toString('hex');
     const publicKeyHex = Buffer.from(publicKey).toString('hex');
-    
+
     return {
       publicKey: publicKeyHex, // Hex format
       privateKey: privateKeyHex, // Hex format
@@ -67,12 +67,10 @@ export async function generateServerIdentityKeypair(): Promise<ServerIdentityKey
  * Sign data with Ed25519 private key (hex or PEM format)
  */
 export async function signEd25519(privateKeyHex: string, data: Buffer | string): Promise<string> {
-  const dataBytes = typeof data === 'string' 
-    ? Buffer.from(data, 'utf8') 
-    : data;
-  
+  const dataBytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+
   let privateKeyBytes: Uint8Array | null = null;
-  
+
   // Check if it's PEM format
   if (privateKeyHex.includes('-----BEGIN') || privateKeyHex.includes('\\n')) {
     try {
@@ -84,10 +82,14 @@ export async function signEd25519(privateKeyHex: string, data: Buffer | string):
       return Buffer.from(signatureBuf).toString('hex');
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('Failed to parse PEM private key', {
-        keyPrefix: privateKeyHex.substring(0, 50),
-        error: errorMessage,
-      }, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to parse PEM private key',
+        {
+          keyPrefix: privateKeyHex.substring(0, 50),
+          error: errorMessage,
+        },
+        error instanceof Error ? error : new Error(String(error))
+      );
       throw new Error(`Invalid private key format (expected hex or PEM): ${errorMessage}`);
     }
   } else {
@@ -95,19 +97,25 @@ export async function signEd25519(privateKeyHex: string, data: Buffer | string):
     try {
       const hexBytes = Buffer.from(privateKeyHex, 'hex');
       if (hexBytes.length !== 32) {
-        throw new Error(`Invalid Ed25519 private key length: expected 32 bytes (64 hex chars), got ${hexBytes.length} bytes (${privateKeyHex.length} hex chars)`);
+        throw new Error(
+          `Invalid Ed25519 private key length: expected 32 bytes (64 hex chars), got ${hexBytes.length} bytes (${privateKeyHex.length} hex chars)`
+        );
       }
       privateKeyBytes = new Uint8Array(hexBytes);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('Failed to parse hex private key', {
-        keyLength: privateKeyHex.length,
-        error: errorMessage,
-      }, error instanceof Error ? error : new Error(String(error)));
+      logger.error(
+        'Failed to parse hex private key',
+        {
+          keyLength: privateKeyHex.length,
+          error: errorMessage,
+        },
+        error instanceof Error ? error : new Error(String(error))
+      );
       throw new Error(`Invalid hex private key format: ${errorMessage}`);
     }
   }
-  
+
   // Final check - TypeScript guard
   if (!privateKeyBytes || privateKeyBytes.length !== 32) {
     throw new Error('Failed to extract valid 32-byte Ed25519 private key');
@@ -121,7 +129,11 @@ export async function signEd25519(privateKeyHex: string, data: Buffer | string):
 /**
  * Verify Ed25519 signature (hex format)
  */
-export async function verifyEd25519(publicKeyHex: string, data: Buffer | string, signatureHex: string): Promise<boolean> {
+export async function verifyEd25519(
+  publicKeyHex: string,
+  data: Buffer | string,
+  signatureHex: string
+): Promise<boolean> {
   // Convert data to Uint8Array - handle Buffer explicitly
   let dataBytes: Uint8Array;
   if (typeof data === 'string') {
@@ -148,8 +160,17 @@ export async function verifyEd25519(publicKeyHex: string, data: Buffer | string,
       } else {
         // Fallback to Node crypto verify for unknown formats
         const publicKeyDer = Buffer.from(publicKeyHex, 'hex');
-        const publicKeyObject = crypto.createPublicKey({ key: publicKeyDer, format: 'der', type: 'spki' });
-        return crypto.verify(null, Buffer.from(dataBytes), publicKeyObject, Buffer.from(signatureBytes));
+        const publicKeyObject = crypto.createPublicKey({
+          key: publicKeyDer,
+          format: 'der',
+          type: 'spki',
+        });
+        return crypto.verify(
+          null,
+          Buffer.from(dataBytes),
+          publicKeyObject,
+          Buffer.from(signatureBytes)
+        );
       }
     }
     return nacl.sign.detached.verify(dataBytes, signatureBytes, publicKeyBytes);
@@ -174,7 +195,7 @@ export function generateECDHKeypair(): ECDHKeypair {
 
 /**
  * Compute shared secret from ECDH
- * 
+ *
  * @param publicKeyHex - Other party's public key in hex format (uncompressed, 65 bytes = 130 hex chars)
  * @param privateKeyHex - Our private key in hex format (32 bytes = 64 hex chars)
  * @returns Shared secret as Buffer
@@ -183,29 +204,37 @@ export function computeECDHSecret(publicKeyHex: string, privateKeyHex: string): 
   try {
     // Validate input lengths
     if (publicKeyHex.length !== 130) {
-      throw new Error(`Invalid public key hex length: expected 130 (65 bytes), got ${publicKeyHex.length}`);
+      throw new Error(
+        `Invalid public key hex length: expected 130 (65 bytes), got ${publicKeyHex.length}`
+      );
     }
     if (privateKeyHex.length !== 64) {
-      throw new Error(`Invalid private key hex length: expected 64 (32 bytes), got ${privateKeyHex.length}`);
+      throw new Error(
+        `Invalid private key hex length: expected 64 (32 bytes), got ${privateKeyHex.length}`
+      );
     }
-    
+
     const ecdh = crypto.createECDH('prime256v1');
     ecdh.setPrivateKey(Buffer.from(privateKeyHex, 'hex'));
-    
+
     // Convert hex string to Buffer
     const publicKeyBuffer = Buffer.from(publicKeyHex, 'hex');
-    
+
     // Validate public key format
     // For P-256, raw format should be 65 bytes (0x04 + 32-byte X + 32-byte Y)
     if (publicKeyBuffer.length !== 65) {
-      throw new Error(`Invalid public key buffer length: expected 65 bytes, got ${publicKeyBuffer.length}`);
+      throw new Error(
+        `Invalid public key buffer length: expected 65 bytes, got ${publicKeyBuffer.length}`
+      );
     }
-    
+
     // Ensure first byte is 0x04 (uncompressed point indicator)
     if (publicKeyBuffer[0] !== 0x04) {
-      throw new Error(`Invalid public key format: expected uncompressed (0x04), got 0x${publicKeyBuffer[0].toString(16).padStart(2, '0')}`);
+      throw new Error(
+        `Invalid public key format: expected uncompressed (0x04), got 0x${publicKeyBuffer[0].toString(16).padStart(2, '0')}`
+      );
     }
-    
+
     // Compute shared secret - Node.js ECDH accepts raw uncompressed format
     return ecdh.computeSecret(publicKeyBuffer);
   } catch (error) {
@@ -222,7 +251,7 @@ export function computeECDHSecret(publicKeyHex: string, privateKeyHex: string): 
 
 /**
  * Derive session keys using HKDF (RFC 5869)
- * 
+ *
  * HKDF(shared_secret, salt, info, length)
  * - salt: SHA256(client_ephemeral_pub || server_ephemeral_pub)
  * - info: "pocketbridge_session_v1"
@@ -281,7 +310,7 @@ export function validateNonce(nonce: string): boolean {
  */
 export function hashForSignature(...parts: (Buffer | Uint8Array | string | object)[]): Buffer {
   const hash = crypto.createHash('sha256');
-  parts.forEach((part) => {
+  parts.forEach(part => {
     let str: string;
     if (Buffer.isBuffer(part) || part instanceof Uint8Array) {
       // Convert Buffer/Uint8Array to hex string
@@ -307,8 +336,3 @@ export function hexToBuffer(hex: string): Buffer {
 export function bufferToHex(buffer: Buffer): string {
   return buffer.toString('hex');
 }
-
-
-
-
-

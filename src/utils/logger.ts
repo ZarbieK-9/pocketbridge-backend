@@ -1,6 +1,6 @@
 /**
  * Production-grade logger using Pino
- * 
+ *
  * Structured JSON logging for production
  * Pretty printing for development
  */

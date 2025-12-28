@@ -86,7 +86,7 @@ function buildApp(sessions) {
 }
 
 describe('Devices & Presence API (multi-schema)', () => {
-  const userId = 'ed25519pubhex-abcdef1234567890';
+  const userId = 'a'.repeat(64); // Valid Ed25519 public key format (64 hex chars)
   const onlineDeviceId = '11111111-1111-1111-1111-111111111111';
   let app;
 

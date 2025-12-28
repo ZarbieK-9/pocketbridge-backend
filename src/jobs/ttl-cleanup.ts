@@ -1,6 +1,6 @@
 /**
  * TTL Cleanup Job
- * 
+ *
  * Periodically removes expired events from database
  * Runs every hour
  */
@@ -24,7 +24,11 @@ export async function cleanupExpiredEvents(db: Database): Promise<void> {
       logger.info('Cleaned up expired events', { count: result.rows.length });
     }
   } catch (error) {
-    logger.error('Failed to cleanup expired events', {}, error instanceof Error ? error : new Error(String(error)));
+    logger.error(
+      'Failed to cleanup expired events',
+      {},
+      error instanceof Error ? error : new Error(String(error))
+    );
   }
 }
 
@@ -35,19 +39,22 @@ export function startTTLCleanupJob(db: Database, intervalMs: number = 3600000): 
   logger.info('Starting TTL cleanup job', { intervalMs });
 
   // Run immediately on start (handle promise to avoid unhandled rejection)
-  cleanupExpiredEvents(db).catch((error) => {
-    logger.error('TTL cleanup job error on startup', {}, error instanceof Error ? error : new Error(String(error)));
+  cleanupExpiredEvents(db).catch(error => {
+    logger.error(
+      'TTL cleanup job error on startup',
+      {},
+      error instanceof Error ? error : new Error(String(error))
+    );
   });
 
   // Then run periodically
   setInterval(() => {
-    cleanupExpiredEvents(db).catch((error) => {
-      logger.error('TTL cleanup job error', {}, error instanceof Error ? error : new Error(String(error)));
+    cleanupExpiredEvents(db).catch(error => {
+      logger.error(
+        'TTL cleanup job error',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
     });
   }, intervalMs);
 }
-
-
-
-
-
