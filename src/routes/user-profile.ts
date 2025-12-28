@@ -167,13 +167,18 @@ router.post('/user/profile', async (req: Request, res: Response) => {
     }
 
     // Check timestamp is recent (within 5 minutes)
+    // Allow small clock skew (up to 30 seconds in the future)
     const now = Date.now();
     const timestampAge = now - timestamp;
-    if (timestampAge < 0 || timestampAge > 5 * 60 * 1000) {
+    const clockSkew = timestamp - now; // Positive if client clock is ahead
+    
+    // Allow up to 30 seconds clock skew (client clock ahead)
+    // Reject if timestamp is more than 5 minutes old
+    if (clockSkew > 30 * 1000 || timestampAge > 5 * 60 * 1000) {
       return res.status(400).json({
         error: 'Invalid timestamp',
         code: 'TIMESTAMP_EXPIRED',
-        message: 'Timestamp must be recent (within 5 minutes)',
+        message: `Timestamp must be recent (within 5 minutes). Age: ${Math.round(timestampAge / 1000)}s, Skew: ${Math.round(clockSkew / 1000)}s`,
       });
     }
 
@@ -366,13 +371,18 @@ router.post('/user/profile/onboarding-complete', async (req: Request, res: Respo
       });
     }
 
-    // Check timestamp
+    // Check timestamp (allow up to 30 seconds clock skew)
     const now = Date.now();
     const timestampAge = now - timestamp;
-    if (timestampAge < 0 || timestampAge > 5 * 60 * 1000) {
+    const clockSkew = timestamp - now; // Positive if client clock is ahead
+    
+    // Allow up to 30 seconds clock skew (client clock ahead)
+    // Reject if timestamp is more than 5 minutes old
+    if (clockSkew > 30 * 1000 || timestampAge > 5 * 60 * 1000) {
       return res.status(400).json({
         error: 'Invalid timestamp',
         code: 'TIMESTAMP_EXPIRED',
+        message: `Timestamp must be recent. Age: ${Math.round(timestampAge / 1000)}s, Skew: ${Math.round(clockSkew / 1000)}s`,
       });
     }
 
