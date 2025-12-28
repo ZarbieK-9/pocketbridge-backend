@@ -317,6 +317,10 @@ async function start() {
     // Set database for devices routes
     setDevicesDatabase(db);
 
+    // Set database for user profile routes
+    const { setDatabase: setUserProfileDatabase } = await import('./routes/user-profile.js');
+    setUserProfileDatabase(db);
+
     // Initialize Redis
     redis = await initRedis();
     logger.info('Redis connected');
