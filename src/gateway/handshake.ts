@@ -235,8 +235,37 @@ async function handleClientHello(
   serverIdentity: ServerIdentityKeypair
 ): Promise<HandshakeResult> {
   try {
-    // Validate nonce
+    // Validate message structure
+    if (!message || typeof message !== 'object') {
+      logger.warn('handleClientHello: Invalid message structure', { message });
+      resetHandshakeStateOnError(ws, 'invalid_message_structure');
+      return { success: false, error: 'Invalid message structure' };
+    }
+
+    if (!message.client_ephemeral_pub || typeof message.client_ephemeral_pub !== 'string') {
+      logger.warn('handleClientHello: Missing or invalid client_ephemeral_pub', {
+        hasClientEphemeralPub: !!message.client_ephemeral_pub,
+        type: typeof message.client_ephemeral_pub,
+      });
+      resetHandshakeStateOnError(ws, 'invalid_client_ephemeral_pub');
+      return { success: false, error: 'Missing or invalid client_ephemeral_pub' };
+    }
+
+    if (!message.nonce_c || typeof message.nonce_c !== 'string') {
+      logger.warn('handleClientHello: Missing or invalid nonce_c', {
+        hasNonceC: !!message.nonce_c,
+        type: typeof message.nonce_c,
+      });
+      resetHandshakeStateOnError(ws, 'invalid_nonce_c');
+      return { success: false, error: 'Missing or invalid nonce_c' };
+    }
+
+    // Validate nonce format
     if (!validateNonce(message.nonce_c)) {
+      logger.warn('handleClientHello: Invalid nonce format', {
+        nonceCLength: message.nonce_c?.length,
+        nonceCType: typeof message.nonce_c,
+      });
       resetHandshakeStateOnError(ws, 'invalid_nonce_format');
       return { success: false, error: 'Invalid nonce format' };
     }
@@ -328,10 +357,15 @@ async function handleClientHello(
       {
         error: errorMessage,
         errorType: error instanceof Error ? error.constructor.name : typeof error,
-        hasStack: !!errorStack,
+        stack: errorStack,
+        messageType: message?.type,
+        hasClientEphemeralPub: !!message?.client_ephemeral_pub,
+        hasNonceC: !!message?.nonce_c,
+        serverIdentityConfigured: !!(serverIdentity?.publicKeyHex && serverIdentity?.privateKey),
       },
       error instanceof Error ? error : new Error(String(error))
     );
+    resetHandshakeStateOnError(ws, 'handleClientHello_exception');
     return { success: false, error: `handleClientHello failed: ${errorMessage}` };
   }
 }
@@ -346,137 +380,214 @@ async function handleClientAuth(
   db: Database,
   serverIdentity: ServerIdentityKeypair
 ): Promise<HandshakeResult> {
-  // Validate we're in the correct state (double-check after queue processing)
-  if (state.step !== 'server_hello') {
-    logger.warn('handleClientAuth: Invalid state', { currentStep: state.step });
-    return { success: false, error: `Invalid state: expected server_hello, got ${state.step}` };
-  }
-
-  if (!state.nonceC || !state.nonceS || !state.serverEphemeralKeypair) {
-    return { success: false, error: 'Handshake state incomplete' };
-  }
-
-  // Validate nonce
-  if (!validateNonce(message.nonce_c2)) {
-    return { success: false, error: 'Invalid nonce_c2 format' };
-  }
-
-  // Verify client signature
-  // Signature data: SHA256(user_id || device_id || nonce_c || nonce_s || server_ephemeral_pub)
-  // IMPORTANT: The client uses the server_ephemeral_pub from the server_hello message (hex string)
-  // We need to use the same value that was sent to the client
-  const serverEphemeralPubHex = state.serverEphemeralKeypair.publicKey;
-
-  // Log the exact values being hashed for debugging
-  // Show only keys for debug
-  logger.info(`[KEYS] user_id: ${message.user_id}`);
-  logger.info(`[KEYS] device_id: ${message.device_id}`);
-  logger.info(`[KEYS] nonceC: ${state.nonceC}`);
-  logger.info(`[KEYS] nonceS: ${state.nonceS}`);
-  logger.info(`[KEYS] serverEphemeralPub: ${serverEphemeralPubHex}`);
-
-  // Hash the signature data in the same order as the client
-  const signatureData = hashForSignature(
-    message.user_id,
-    message.device_id,
-    state.nonceC,
-    state.nonceS,
-    serverEphemeralPubHex
-  );
-
-  // Log the computed hash for comparison with client (use INFO level so it's visible)
-  const signatureDataHex = Buffer.from(signatureData).toString('hex');
-  logger.info(`[KEYS] signatureDataHash: ${signatureDataHex}`);
-
-  // Verify signature using hex format (user_id is Ed25519 public key in hex)
-  const publicKeyHex = message.user_id;
-  if (publicKeyHex.length !== 64) {
-    // 32 bytes = 64 hex chars
-    resetHandshakeStateOnError(ws, 'invalid_public_key_length');
-    return { success: false, error: 'Invalid public key length' };
-  }
-
-  // Check if device is revoked before completing handshake (security)
-  const revoked = await isDeviceRevoked(db, message.device_id);
-  if (revoked) {
-    logger.warn('Revoked device attempted handshake', {
-      deviceId: message.device_id,
-      userId: message.user_id.substring(0, 16) + '...',
-    });
-    resetHandshakeStateOnError(ws, 'device_revoked');
-    return { success: false, error: 'Device has been revoked' };
-  }
-
-  // Verify signature using tweetnacl-compatible hex format
-  logger.info(`[KEYS] clientSignature: ${message.client_signature}`);
-
-  const isValid = await verifyEd25519(publicKeyHex, signatureData, message.client_signature);
-
-  if (!isValid) {
-    // No log except keys
-    resetHandshakeStateOnError(ws, 'invalid_client_signature');
-    return { success: false, error: 'Invalid client signature' };
-  }
-
-  // Get or create user
-  await db.pool.query('INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING', [
-    message.user_id,
-  ]);
-
-  // Get or create device in multi-schema and get last_ack_device_seq
-  const deviceResult = await db.pool.query(
-    `INSERT INTO user_devices (device_id, user_id, last_ack_device_seq, is_online, last_seen)
-     VALUES ($1::uuid, $2, 0, TRUE, NOW())
-     ON CONFLICT (device_id)
-     DO UPDATE SET last_seen = NOW(), is_online = TRUE
-     RETURNING last_ack_device_seq`,
-    [message.device_id, message.user_id]
-  );
-
-  const lastAckDeviceSeq = deviceResult.rows[0]?.last_ack_device_seq || 0;
-
-  // Create session state
-  const sessionState: SessionState = {
-    userId: message.user_id,
-    deviceId: message.device_id,
-    sessionKeys: {
-      clientKey: state.sessionKeys!.clientKey,
-      serverKey: state.sessionKeys!.serverKey,
-    },
-    lastAckDeviceSeq,
-    createdAt: Date.now(),
-  };
-
-  // Send Session Established
-  const expiresAt = Date.now() + config.websocket.sessionTimeout;
-  const sessionEstablished: SessionEstablished = {
-    type: 'session_established',
-    device_id: message.device_id,
-    last_ack_device_seq: lastAckDeviceSeq,
-    expires_at: expiresAt,
-  };
-
-  const sessionEstablishedMessage = {
-    type: 'session_established',
-    payload: sessionEstablished,
-  };
-
   try {
-    ws.send(JSON.stringify(sessionEstablishedMessage));
+    // Validate message structure
+    if (!message || typeof message !== 'object') {
+      logger.warn('handleClientAuth: Invalid message structure', { message });
+      resetHandshakeStateOnError(ws, 'invalid_message_structure');
+      return { success: false, error: 'Invalid message structure' };
+    }
+
+    if (!message.user_id || typeof message.user_id !== 'string') {
+      logger.warn('handleClientAuth: Missing or invalid user_id', {
+        hasUserId: !!message.user_id,
+        type: typeof message.user_id,
+      });
+      resetHandshakeStateOnError(ws, 'invalid_user_id');
+      return { success: false, error: 'Missing or invalid user_id' };
+    }
+
+    if (!message.device_id || typeof message.device_id !== 'string') {
+      logger.warn('handleClientAuth: Missing or invalid device_id', {
+        hasDeviceId: !!message.device_id,
+        type: typeof message.device_id,
+      });
+      resetHandshakeStateOnError(ws, 'invalid_device_id');
+      return { success: false, error: 'Missing or invalid device_id' };
+    }
+
+    if (!message.client_signature || typeof message.client_signature !== 'string') {
+      logger.warn('handleClientAuth: Missing or invalid client_signature', {
+        hasClientSignature: !!message.client_signature,
+        type: typeof message.client_signature,
+      });
+      resetHandshakeStateOnError(ws, 'invalid_client_signature');
+      return { success: false, error: 'Missing or invalid client_signature' };
+    }
+
+    // Validate we're in the correct state (double-check after queue processing)
+    if (state.step !== 'server_hello') {
+      logger.warn('handleClientAuth: Invalid state', { currentStep: state.step });
+      resetHandshakeStateOnError(ws, 'invalid_state');
+      return { success: false, error: `Invalid state: expected server_hello, got ${state.step}` };
+    }
+
+    if (!state.nonceC || !state.nonceS || !state.serverEphemeralKeypair) {
+      logger.warn('handleClientAuth: Handshake state incomplete', {
+        hasNonceC: !!state.nonceC,
+        hasNonceS: !!state.nonceS,
+        hasServerEphemeralKeypair: !!state.serverEphemeralKeypair,
+        stateStep: state.step,
+      });
+      resetHandshakeStateOnError(ws, 'handshake_state_incomplete');
+      return { success: false, error: 'Handshake state incomplete' };
+    }
+
+    // Validate nonce_c2
+    if (!message.nonce_c2 || typeof message.nonce_c2 !== 'string') {
+      logger.warn('handleClientAuth: Missing or invalid nonce_c2', {
+        hasNonceC2: !!message.nonce_c2,
+        type: typeof message.nonce_c2,
+      });
+      resetHandshakeStateOnError(ws, 'invalid_nonce_c2');
+      return { success: false, error: 'Missing or invalid nonce_c2' };
+    }
+
+    // Validate nonce format
+    if (!validateNonce(message.nonce_c2)) {
+      logger.warn('handleClientAuth: Invalid nonce_c2 format', {
+        nonceC2Length: message.nonce_c2?.length,
+        nonceC2Type: typeof message.nonce_c2,
+      });
+      resetHandshakeStateOnError(ws, 'invalid_nonce_c2_format');
+      return { success: false, error: 'Invalid nonce_c2 format' };
+    }
+
+    // Verify client signature
+    // Signature data: SHA256(user_id || device_id || nonce_c || nonce_s || server_ephemeral_pub)
+    // IMPORTANT: The client uses the server_ephemeral_pub from the server_hello message (hex string)
+    // We need to use the same value that was sent to the client
+    const serverEphemeralPubHex = state.serverEphemeralKeypair.publicKey;
+
+    // Log the exact values being hashed for debugging
+    // Show only keys for debug
+    logger.info(`[KEYS] user_id: ${message.user_id}`);
+    logger.info(`[KEYS] device_id: ${message.device_id}`);
+    logger.info(`[KEYS] nonceC: ${state.nonceC}`);
+    logger.info(`[KEYS] nonceS: ${state.nonceS}`);
+    logger.info(`[KEYS] serverEphemeralPub: ${serverEphemeralPubHex}`);
+
+    // Hash the signature data in the same order as the client
+    const signatureData = hashForSignature(
+      message.user_id,
+      message.device_id,
+      state.nonceC,
+      state.nonceS,
+      serverEphemeralPubHex
+    );
+
+    // Log the computed hash for comparison with client (use INFO level so it's visible)
+    const signatureDataHex = Buffer.from(signatureData).toString('hex');
+    logger.info(`[KEYS] signatureDataHash: ${signatureDataHex}`);
+
+    // Verify signature using hex format (user_id is Ed25519 public key in hex)
+    const publicKeyHex = message.user_id;
+    if (publicKeyHex.length !== 64) {
+      // 32 bytes = 64 hex chars
+      resetHandshakeStateOnError(ws, 'invalid_public_key_length');
+      return { success: false, error: 'Invalid public key length' };
+    }
+
+    // Check if device is revoked before completing handshake (security)
+    const revoked = await isDeviceRevoked(db, message.device_id);
+    if (revoked) {
+      logger.warn('Revoked device attempted handshake', {
+        deviceId: message.device_id,
+        userId: message.user_id.substring(0, 16) + '...',
+      });
+      resetHandshakeStateOnError(ws, 'device_revoked');
+      return { success: false, error: 'Device has been revoked' };
+    }
+
+    // Verify signature using tweetnacl-compatible hex format
+    logger.info(`[KEYS] clientSignature: ${message.client_signature}`);
+
+    const isValid = await verifyEd25519(publicKeyHex, signatureData, message.client_signature);
+
+    if (!isValid) {
+      // No log except keys
+      resetHandshakeStateOnError(ws, 'invalid_client_signature');
+      return { success: false, error: 'Invalid client signature' };
+    }
+
+    // Get or create user
+    await db.pool.query('INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING', [
+      message.user_id,
+    ]);
+
+    // Get or create device in multi-schema and get last_ack_device_seq
+    const deviceResult = await db.pool.query(
+      `INSERT INTO user_devices (device_id, user_id, last_ack_device_seq, is_online, last_seen)
+       VALUES ($1::uuid, $2, 0, TRUE, NOW())
+       ON CONFLICT (device_id)
+       DO UPDATE SET last_seen = NOW(), is_online = TRUE
+       RETURNING last_ack_device_seq`,
+      [message.device_id, message.user_id]
+    );
+
+    const lastAckDeviceSeq = deviceResult.rows[0]?.last_ack_device_seq || 0;
+
+    // Create session state
+    const sessionState: SessionState = {
+      userId: message.user_id,
+      deviceId: message.device_id,
+      sessionKeys: {
+        clientKey: state.sessionKeys!.clientKey,
+        serverKey: state.sessionKeys!.serverKey,
+      },
+      lastAckDeviceSeq,
+      createdAt: Date.now(),
+    };
+
+    // Send Session Established
+    const expiresAt = Date.now() + config.websocket.sessionTimeout;
+    const sessionEstablished: SessionEstablished = {
+      type: 'session_established',
+      device_id: message.device_id,
+      last_ack_device_seq: lastAckDeviceSeq,
+      expires_at: expiresAt,
+    };
+
+    const sessionEstablishedMessage = {
+      type: 'session_established',
+      payload: sessionEstablished,
+    };
+
+    try {
+      ws.send(JSON.stringify(sessionEstablishedMessage));
+    } catch (error) {
+      logger.error(
+        'Failed to send session_established message',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
+      throw error;
+    }
+
+    // Clear handshake state
+    handshakeStates.delete(ws);
+
+    return {
+      success: true,
+      sessionState,
+    };
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
     logger.error(
-      'Failed to send session_established message',
-      {},
+      'handleClientAuth: Exception occurred',
+      {
+        error: errorMessage,
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+        stack: errorStack,
+        hasUserId: !!message?.user_id,
+        hasDeviceId: !!message?.device_id,
+        hasClientSignature: !!message?.client_signature,
+        stateStep: state?.step,
+      },
       error instanceof Error ? error : new Error(String(error))
     );
-    throw error;
+    resetHandshakeStateOnError(ws, 'handleClientAuth_exception');
+    return { success: false, error: `handleClientAuth failed: ${errorMessage}` };
   }
-
-  // Clear handshake state
-  handshakeStates.delete(ws);
-
-  return {
-    success: true,
-    sessionState,
-  };
 }

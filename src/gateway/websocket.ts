@@ -309,7 +309,23 @@ export function createWebSocketGateway(
           throw new Error('Message too large');
         }
 
-        const message = JSON.parse(data.toString('utf8'));
+        let message: any;
+        try {
+          message = JSON.parse(data.toString('utf8'));
+        } catch (parseError) {
+          logger.error(
+            'Failed to parse WebSocket message',
+            {
+              clientId,
+              dataLength: data.length,
+              dataPreview: data.toString('utf8').substring(0, 200),
+              error: parseError instanceof Error ? parseError.message : String(parseError),
+            },
+            parseError instanceof Error ? parseError : new Error(String(parseError))
+          );
+          ws.close(1008, 'Invalid message format');
+          return;
+        }
 
         logger.debug('Received message', {
           clientId,
@@ -318,7 +334,8 @@ export function createWebSocketGateway(
           handshakeComplete,
           rateLimitChecked,
           rateLimitAllowed,
-          messageType: message.type,
+          messageType: message?.type,
+          hasPayload: !!message?.payload,
         });
 
         if (!handshakeComplete) {

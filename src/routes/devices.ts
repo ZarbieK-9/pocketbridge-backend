@@ -89,9 +89,9 @@ router.get('/devices', async (req: Request, res: Response) => {
       
       return {
         device_id: deviceIdStr,
-        device_name: row.device_name || null,
-        device_type: row.device_type || null,
-        device_os: row.device_os || null,
+        device_name: row.device_name || undefined,
+        device_type: (row.device_type as 'mobile' | 'desktop' | 'web' | undefined) || undefined,
+        device_os: row.device_os || undefined,
         is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
         last_seen: lastSeenTimestamp,
         ip_address: row.ip_address || undefined,
@@ -100,27 +100,50 @@ router.get('/devices', async (req: Request, res: Response) => {
 
     // Handle empty state
     const is_empty = devices.length === 0;
-    return res.json({
+    const response: {
+      devices: DeviceInfo[];
+      count: number;
+      is_empty: boolean;
+      message?: string;
+    } = {
       devices,
       count: devices.length,
       is_empty,
-      message: is_empty ? 'No devices connected. Connect a device to start syncing.' : undefined,
-    });
+    };
+    if (is_empty) {
+      response.message = 'No devices connected. Connect a device to start syncing.';
+    }
+    return res.json(response);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
+    const errorName = error instanceof Error ? error.name : typeof error;
+    
+    // Log full error details
     logger.error(
       'Failed to get devices',
       {
         userId: (req as any).userId,
         error: errorMessage,
+        errorName,
         stack: errorStack,
+        path: req.path,
+        method: req.method,
+        hasDatabase: !!database,
+        hasSessionsMap: !!sessionsMap,
       },
       error instanceof Error ? error : new Error(String(error))
     );
+    
+    // Return error response with details in development
+    const isDevelopment = process.env.NODE_ENV === 'development';
     res.status(500).json({ 
       error: 'Failed to get devices',
-      message: process.env.NODE_ENV === 'development' ? errorMessage : undefined,
+      ...(isDevelopment && {
+        message: errorMessage,
+        errorName,
+        stack: errorStack,
+      }),
     });
   }
 });
@@ -167,12 +190,17 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
     }
 
     const device = result.rows[0];
+    // Convert device_id to string for sessionsMap lookup
+    const deviceIdStr = typeof device.device_id === 'string' 
+      ? device.device_id 
+      : device.device_id?.toString() || String(device.device_id);
+    
     res.json({
-      device_id: device.device_id,
-      device_name: device.device_name,
-      device_type: device.device_type,
-      device_os: device.device_os,
-      is_online: sessionsMap ? sessionsMap.has(device.device_id) : false,
+      device_id: deviceIdStr,
+      device_name: device.device_name || undefined,
+      device_type: device.device_type || undefined,
+      device_os: device.device_os || undefined,
+      is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
       last_seen: new Date(device.last_seen).getTime(),
       registered_at: new Date(device.registered_at).getTime(),
     });
