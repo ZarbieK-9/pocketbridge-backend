@@ -30,8 +30,8 @@ export async function cleanupOldEvents(
   db: Database,
   retentionDays: number = DEFAULT_CONFIG.eventRetentionDays
 ): Promise<number> {
+  const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
   try {
-    const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
 
     const result = await db.pool.query(
       `DELETE FROM events 
@@ -79,8 +79,8 @@ export async function cleanupInactiveDevices(
   db: Database,
   inactiveDays: number = DEFAULT_CONFIG.deviceInactiveDays
 ): Promise<number> {
+  const cutoffDate = new Date(Date.now() - inactiveDays * 24 * 60 * 60 * 1000);
   try {
-    const cutoffDate = new Date(Date.now() - inactiveDays * 24 * 60 * 60 * 1000);
 
     // Only clean up devices that are:
     // 1. Not online
@@ -137,8 +137,8 @@ export async function cleanupOldSessions(
   db: Database,
   retentionDays: number = DEFAULT_CONFIG.sessionRetentionDays
 ): Promise<number> {
+  const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
   try {
-    const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
 
     const result = await db.pool.query(
       `DELETE FROM user_sessions
