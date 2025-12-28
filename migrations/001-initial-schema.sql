@@ -56,8 +56,12 @@ CREATE TABLE IF NOT EXISTS revoked_devices (
 -- Pairing codes table (temporary, expires after 10 minutes)
 CREATE TABLE IF NOT EXISTS pairing_codes (
   code TEXT PRIMARY KEY,
+  ws_url TEXT NOT NULL,
   user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-  device_id TEXT,
+  device_id TEXT NOT NULL,
+  device_name TEXT,
+  public_key_hex TEXT NOT NULL,
+  private_key_hex TEXT NOT NULL,
   expires_at TIMESTAMP NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );

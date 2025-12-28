@@ -83,15 +83,29 @@ router.post('/store', async (req: Request, res: Response) => {
       expiresIn: 10 * 60 * 1000, // 10 minutes in milliseconds
     });
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    
     logger.error(
       'Failed to store pairing code',
-      { body: req.body },
+      { 
+        body: req.body,
+        error: errorMessage,
+        stack: errorStack,
+        errorName: error instanceof Error ? error.name : 'Unknown',
+      },
       error instanceof Error ? error : new Error(String(error))
     );
+    
     if (error instanceof ValidationError) {
       res.status(400).json({ error: error.message });
     } else {
-      res.status(500).json({ error: 'Failed to store pairing code' });
+      // Include more details in development
+      const isDevelopment = process.env.NODE_ENV !== 'production';
+      res.status(500).json({ 
+        error: 'Failed to store pairing code',
+        ...(isDevelopment && { details: errorMessage, stack: errorStack })
+      });
     }
   }
 });
