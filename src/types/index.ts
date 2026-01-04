@@ -112,6 +112,7 @@ export interface DeviceInfo {
   device_os?: string;
   is_online: boolean;
   last_seen: number; // Unix timestamp
+  registered_at?: number; // Unix timestamp
   ip_address?: string;
 }
 

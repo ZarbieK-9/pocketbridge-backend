@@ -8,10 +8,11 @@
 import { Router, Request, Response } from 'express';
 import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
+import type { Database } from '../db/postgres.js';
 
-let dbInstance: any = null;
+let dbInstance: Database | null = null;
 
-export function setDatabase(db: any) {
+export function setDatabase(db: Database): void {
   dbInstance = db;
 }
 

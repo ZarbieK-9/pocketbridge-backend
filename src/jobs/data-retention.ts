@@ -218,11 +218,12 @@ export async function runDataRetentionCleanup(
 /**
  * Start data retention job
  * Runs daily at specified time
+ * Returns cleanup function to clear interval
  */
 export function startDataRetentionJob(
   db: Database,
   intervalMs: number = 24 * 60 * 60 * 1000
-): void {
+): () => void {
   logger.info('Starting data retention job', { intervalMs });
 
   // Run immediately on start
@@ -239,7 +240,7 @@ export function startDataRetentionJob(
   });
 
   // Then run periodically
-  setInterval(() => {
+  const interval = setInterval(() => {
     runDataRetentionCleanup(db).catch(error => {
       const errorContext = {
         error: error instanceof Error ? error.message : String(error),
@@ -252,4 +253,10 @@ export function startDataRetentionJob(
       });
     });
   }, intervalMs);
+
+  // Return cleanup function
+  return () => {
+    clearInterval(interval);
+    logger.debug('Data retention job stopped');
+  };
 }

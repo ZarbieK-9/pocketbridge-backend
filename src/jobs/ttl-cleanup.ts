@@ -34,8 +34,9 @@ export async function cleanupExpiredEvents(db: Database): Promise<void> {
 
 /**
  * Start TTL cleanup job
+ * Returns cleanup function to clear interval
  */
-export function startTTLCleanupJob(db: Database, intervalMs: number = 3600000): void {
+export function startTTLCleanupJob(db: Database, intervalMs: number = 3600000): () => void {
   logger.info('Starting TTL cleanup job', { intervalMs });
 
   // Run immediately on start (handle promise to avoid unhandled rejection)
@@ -48,7 +49,7 @@ export function startTTLCleanupJob(db: Database, intervalMs: number = 3600000): 
   });
 
   // Then run periodically
-  setInterval(() => {
+  const interval = setInterval(() => {
     cleanupExpiredEvents(db).catch(error => {
       logger.error(
         'TTL cleanup job error',
@@ -57,4 +58,10 @@ export function startTTLCleanupJob(db: Database, intervalMs: number = 3600000): 
       );
     });
   }, intervalMs);
+
+  // Return cleanup function
+  return () => {
+    clearInterval(interval);
+    logger.debug('TTL cleanup job stopped');
+  };
 }

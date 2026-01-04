@@ -102,8 +102,8 @@ export function createWebSocketGateway(
   const bufferedMessageCount = new WeakMap<WebSocket, number>();
   const MAX_BUFFERED_MESSAGES = 100; // Maximum messages to buffer before closing connection
 
-  // Enforce session timeouts periodically
-  setInterval(() => {
+  // Store session timeout interval for cleanup
+  const sessionTimeoutInterval = setInterval(() => {
     const now = Date.now();
     const warningThresholdMs = 5 * 60 * 1000; // 5 minutes before expiry
     const sessionTimeoutMs = config.websocket.sessionTimeout;
@@ -505,7 +505,7 @@ export function createWebSocketGateway(
               // Subscribe to Redis channel for this device
               try {
                 const subscriber = await subscribeToDeviceChannel(
-                  redis.client,
+                  redis,
                   newSessionState.userId,
                   newSessionState.deviceId,
                   ws
@@ -531,7 +531,7 @@ export function createWebSocketGateway(
 
               // Update presence
               try {
-                await updatePresence(redis.client, newSessionState.deviceId, true);
+                await updatePresence(redis, newSessionState.deviceId, true);
               } catch (error) {
                 logger.error(
                   'Failed to update presence',
@@ -817,21 +817,6 @@ export function createWebSocketGateway(
       }
 
       if (sessionState) {
-        // Update device offline status in database
-        try {
-          await db.pool.query(
-            'UPDATE user_devices SET is_online = FALSE, last_seen = NOW() WHERE device_id = $1::uuid',
-            [sessionState.deviceId]
-          );
-          logger.debug('Device marked as offline', { deviceId: sessionState.deviceId });
-        } catch (error) {
-          logger.error(
-            'Failed to update device offline status',
-            { deviceId: sessionState.deviceId },
-            error instanceof Error ? error : new Error(String(error))
-          );
-        }
-
         // Track disconnection metrics
         incrementCounter('websocket_connections_total', { status: 'disconnected' });
         setGauge('websocket_connections_active', wss.clients.size);
@@ -854,7 +839,7 @@ export function createWebSocketGateway(
         }
         decrementConnection(sessionState.userId, sessionState.deviceId);
         try {
-          await updatePresence(redis.client, sessionState.deviceId, false);
+          await updatePresence(redis, sessionState.deviceId, false);
         } catch (error) {
           logger.error(
             'Failed to update presence on disconnect',
@@ -865,7 +850,7 @@ export function createWebSocketGateway(
           );
         }
 
-        // Persist offline status in DB (eventual consistency)
+        // Update device offline status in database (single update, no duplicate)
         try {
           await db.pool.query(
             `UPDATE user_devices
@@ -873,6 +858,7 @@ export function createWebSocketGateway(
                WHERE device_id = $1::uuid`,
             [sessionState.deviceId]
           );
+          logger.debug('Device marked as offline', { deviceId: sessionState.deviceId });
         } catch (error) {
           logger.warn(
             'Failed to update offline status in DB',
@@ -976,15 +962,23 @@ export function createWebSocketGateway(
     });
   }
 
-  // Return sessions Map for status API access
-  return sessionManager.getAllSessionsFlat();
+  // Return sessions Map for status API access, along with cleanup function
+  const sessionsMap = sessionManager.getAllSessionsFlat();
+  
+  // Attach cleanup function to returned object (stored as a property for graceful shutdown)
+  (sessionsMap as any)._cleanup = () => {
+    clearInterval(sessionTimeoutInterval);
+    logger.debug('Session timeout interval cleared');
+  };
+  
+  return sessionsMap;
 }
 
 /**
  * Subscribe to Redis channel for device events
  */
 async function subscribeToDeviceChannel(
-  redis: any,
+  redis: RedisConnection,
   userId: string,
   deviceId: string,
   ws: WebSocket
@@ -992,7 +986,7 @@ async function subscribeToDeviceChannel(
   const channel = `user:${userId}:device:${deviceId}`;
 
   // Subscribe to Redis Pub/Sub
-  const subscriber = redis.duplicate();
+  const subscriber = redis.client.duplicate();
 
   // Connect subscriber if connect method exists (Redis v4+)
   if (subscriber.connect && typeof subscriber.connect === 'function') {
@@ -1020,7 +1014,7 @@ async function subscribeToDeviceChannel(
 /**
  * Update device presence
  */
-async function updatePresence(redis: any, deviceId: string, isOnline: boolean): Promise<void> {
+async function updatePresence(redis: RedisConnection, deviceId: string, isOnline: boolean): Promise<void> {
   if (!redis) {
     return; // Skip if Redis not available
   }
@@ -1028,19 +1022,9 @@ async function updatePresence(redis: any, deviceId: string, isOnline: boolean): 
   const key = `presence:${deviceId}`;
   try {
     if (isOnline) {
-      if (redis.setEx && typeof redis.setEx === 'function') {
-        await redis.setEx(key, 300, 'online'); // 5 minute TTL
-      } else if (redis.set && typeof redis.set === 'function') {
-        // Fallback for older Redis clients
-        await redis.set(key, 'online', 'EX', 300);
-      }
+      await redis.client.setEx(key, 300, 'online'); // 5 minute TTL
     } else {
-      if (redis.del && typeof redis.del === 'function') {
-        await redis.del(key);
-      } else if (redis.delete && typeof redis.delete === 'function') {
-        // Fallback for some Redis clients
-        await redis.delete(key);
-      }
+      await redis.client.del(key);
     }
   } catch (error) {
     // Log but don't throw - presence is not critical

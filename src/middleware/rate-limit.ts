@@ -28,11 +28,22 @@ interface RateLimitStore {
 export class RateLimiter {
   private store: RateLimitStore = {};
   private config: RateLimitConfig;
+  private cleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(config: RateLimitConfig) {
     this.config = config;
     // Cleanup expired entries every minute
-    setInterval(() => this.cleanup(), 60000);
+    this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
+  }
+
+  /**
+   * Stop the cleanup interval (for graceful shutdown)
+   */
+  stop(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
   }
 
   /**

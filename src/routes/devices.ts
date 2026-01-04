@@ -14,17 +14,18 @@ import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
 import { sanitizeDeviceName } from '../utils/validation.js';
 import type { SessionState, DeviceInfo } from '../types/index.js';
+import type { Database } from '../db/postgres.js';
 import { config } from '../config.js';
 
 // Store reference to sessions Map from WebSocket gateway
 let sessionsMap: Map<string, SessionState> | null = null;
-let database: any = null;
+let database: Database | null = null;
 
 export function setSessionsMap(sessions: Map<string, SessionState>): void {
   sessionsMap = sessions;
 }
 
-export function setDatabase(db: any): void {
+export function setDatabase(db: Database): void {
   database = db;
 }
 
@@ -85,7 +86,7 @@ router.get('/devices', async (req: Request, res: Response) => {
           last_seen, registered_at, ip_address
          FROM user_devices
          WHERE user_id = $1
-         ORDER BY last_seen DESC`,
+         ORDER BY is_online DESC, last_seen DESC`,
         [userId]
       );
     } catch (queryError) {
@@ -140,6 +141,19 @@ router.get('/devices', async (req: Request, res: Response) => {
           }
         }
         
+        // Safely convert registered_at to timestamp
+        let registeredAtTimestamp: number | undefined = undefined;
+        try {
+          if (row.registered_at) {
+            registeredAtTimestamp = new Date(row.registered_at).getTime();
+            if (isNaN(registeredAtTimestamp)) {
+              registeredAtTimestamp = undefined;
+            }
+          }
+        } catch {
+          registeredAtTimestamp = undefined;
+        }
+
         return {
           device_id: deviceIdStr,
           device_name: row.device_name || undefined,
@@ -147,6 +161,7 @@ router.get('/devices', async (req: Request, res: Response) => {
           device_os: row.device_os || undefined,
           is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
           last_seen: lastSeenTimestamp,
+          registered_at: registeredAtTimestamp,
           ip_address: row.ip_address ? String(row.ip_address) : undefined,
         };
       } catch (mapError) {

@@ -260,6 +260,9 @@ const wss = new WebSocketServer({
 // Initialize services
 let db: Awaited<ReturnType<typeof initDatabase>> | null = null;
 let redis: Awaited<ReturnType<typeof initRedis>> | null = null;
+let ttlCleanupStop: (() => void) | null = null;
+let dataRetentionStop: (() => void) | null = null;
+let websocketSessionsMap: Map<string, any> | null = null;
 let isShuttingDown = false;
 
 async function start() {
@@ -326,20 +329,20 @@ async function start() {
     logger.info('Redis connected');
 
     // Create WebSocket gateway
-    const sessions = createWebSocketGateway(wss, { db, redis });
-    setDevicesSessionsMap(sessions);
-    setUserSessionsMap(sessions);
-    setStatusSessionsMap(sessions);
+    websocketSessionsMap = createWebSocketGateway(wss, { db, redis });
+    setDevicesSessionsMap(websocketSessionsMap);
+    setUserSessionsMap(websocketSessionsMap);
+    setStatusSessionsMap(websocketSessionsMap);
     setStatusDatabase(db);
     logger.info('WebSocket gateway ready');
 
-    // Start TTL cleanup job
-    startTTLCleanupJob(db, 3600000); // Every hour
+    // Start TTL cleanup job (store cleanup function)
+    ttlCleanupStop = startTTLCleanupJob(db, 3600000); // Every hour
     logger.info('TTL cleanup job started');
 
-    // Start data retention job
+    // Start data retention job (store cleanup function)
     const { startDataRetentionJob } = await import('./jobs/data-retention.js');
-    startDataRetentionJob(db, 24 * 60 * 60 * 1000); // Daily
+    dataRetentionStop = startDataRetentionJob(db, 24 * 60 * 60 * 1000); // Daily
     logger.info('Data retention job started');
 
     // Handle server listen errors (MUST be set up BEFORE server.listen())

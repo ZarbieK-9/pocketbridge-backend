@@ -12,10 +12,11 @@ import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
 import { verifyEd25519 } from '../crypto/utils.js';
 import { sanitizeDeviceName } from '../utils/validation.js';
+import type { Database } from '../db/postgres.js';
 
-let database: any = null;
+let database: Database | null = null;
 
-export function setDatabase(db: any): void {
+export function setDatabase(db: Database): void {
   database = db;
 }
 
