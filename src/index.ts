@@ -516,6 +516,20 @@ async function gracefulShutdown(signal: string): Promise<void> {
     }
   }
 
+  // Call cleanup function on websocket sessions if available
+  if (websocketSessionsMap && typeof (websocketSessionsMap as any)._cleanup === 'function') {
+    try {
+      (websocketSessionsMap as any)._cleanup();
+      logger.info('WebSocket cleanup completed');
+    } catch (error) {
+      logger.error(
+        'Error during WebSocket cleanup',
+        {},
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+
   logger.info('Graceful shutdown complete');
   process.exit(0);
 }

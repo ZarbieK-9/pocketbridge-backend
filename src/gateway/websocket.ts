@@ -753,6 +753,13 @@ export function createWebSocketGateway(
 
     // Handle connection close
     ws.on('close', async () => {
+      // Cleanup handshake timeout
+      const timeout = handshakeTimeouts.get(ws);
+      if (timeout) {
+        clearTimeout(timeout);
+        handshakeTimeouts.delete(ws);
+      }
+
       // Cleanup heartbeat
       const heartbeatInterval = heartbeatIntervals.get(ws);
       if (heartbeatInterval) {
@@ -969,6 +976,16 @@ export function createWebSocketGateway(
   (sessionsMap as any)._cleanup = () => {
     clearInterval(sessionTimeoutInterval);
     logger.debug('Session timeout interval cleared');
+    
+    // Also clear all active handshake timeouts
+    handshakeTimeouts.forEach((timeout) => {
+      clearTimeout(timeout);
+    });
+    
+    // Clear all active heartbeat intervals
+    heartbeatIntervals.forEach((interval) => {
+      clearInterval(interval);
+    });
   };
   
   return sessionsMap;
