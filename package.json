@@ -15,9 +15,11 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\"",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node scripts/pocketbridge-test-suite.js",
+    "test:unit": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "check-db": "tsx scripts/check-db.ts"
   },
   "dependencies": {
     "tweetnacl": "^1.0.3",

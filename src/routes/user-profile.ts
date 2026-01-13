@@ -67,6 +67,12 @@ router.get('/user/profile', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
+    // Ensure user row exists to satisfy FK constraint on user_profiles
+    await database.pool.query(
+      `INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+      [userId]
+    );
+
     // Get or create user profile
     const result = await database.pool.query(
       `SELECT 
@@ -148,6 +154,12 @@ router.post('/user/profile', async (req: Request, res: Response) => {
     if (!database) {
       return res.status(503).json({ error: 'Database not initialized' });
     }
+
+    // Ensure user row exists to satisfy FK constraint on user_profiles
+    await database.pool.query(
+      `INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+      [userId]
+    );
 
     // Validate signature is provided
     if (!signature || typeof signature !== 'string') {

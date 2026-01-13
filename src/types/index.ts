@@ -133,6 +133,8 @@ export interface DeviceStatusChange {
   type: 'device_status_changed';
   device_id: string;
   device_name?: string;
+  device_type?: 'mobile' | 'desktop' | 'web';
+  user_id?: string;
   is_online: boolean;
   timestamp: number;
 }

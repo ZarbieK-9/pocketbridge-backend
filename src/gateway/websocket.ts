@@ -48,6 +48,10 @@ import PresenceBroadcaster from '../services/presence-broadcaster.js';
 import DeviceRelay from '../services/device-relay.js';
 import { incrementCounter, setGauge, recordHistogram } from '../services/metrics.js';
 import type { SessionState, ReplayRequest, ReplayResponse } from '../types/index.js';
+import {
+  initiatePairing,
+  completePairing,
+} from '../services/device-pairing.js';
 import type { ServerIdentityKeypair } from '../crypto/utils.js';
 
 interface GatewayDependencies {
@@ -571,6 +575,24 @@ export function createWebSocketGateway(
                     newSessionState.deviceId,
                     true
                   );
+
+                  // Broadcast presence update to other devices for real-time UI
+                  await deviceRelay.broadcastSystemMessage(
+                    newSessionState.userId,
+                    {
+                      type: 'device_status_changed',
+                      payload: {
+                        type: 'device_status_changed',
+                        user_id: newSessionState.userId,
+                        device_id: newSessionState.deviceId,
+                        device_name: device.device_name || 'Unknown Device',
+                        device_type: device.device_type || 'web',
+                        is_online: true,
+                        timestamp: Date.now(),
+                      },
+                    },
+                    newSessionState.deviceId
+                  );
                 }
               } catch (error) {
                 logger.warn(
@@ -681,6 +703,181 @@ export function createWebSocketGateway(
             await handleAck(message.payload, sessionState, db);
             // Update session in Redis
             await updateSession(redis, sessionState);
+          } else if (message.type === 'initiate_pairing') {
+            // Device initiates pairing - generates 6-digit code
+            try {
+              if (!redis) {
+                throw new Error('Redis client not available');
+              }
+              const code = await initiatePairing(redis, sessionState.userId, sessionState.deviceId);
+              const expiresIn = 5 * 60 * 1000; // 5 minutes
+              ws.send(
+                JSON.stringify({
+                  type: 'pairing_initiated',
+                  payload: {
+                    code,
+                    expiresIn,
+                  },
+                })
+              );
+              logger.info('Pairing code generated', {
+                userId: sessionState.userId.substring(0, 12) + '...',
+                deviceId: sessionState.deviceId,
+                code: code.substring(0, 3) + '***',
+              });
+            } catch (error) {
+              logger.error('Failed to initiate pairing', {
+                userId: sessionState.userId.substring(0, 12) + '...',
+                deviceId: sessionState.deviceId,
+                error: error instanceof Error ? error.message : String(error),
+              }, error);
+              ws.send(
+                JSON.stringify({
+                  type: 'pairing_failed',
+                  payload: {
+                    error: error instanceof Error ? error.message : 'Failed to generate pairing code',
+                  },
+                })
+              );
+            }
+          } else if (message.type === 'complete_pairing') {
+            // Device completes pairing - verifies code and links to initiating user
+            const { pairing_code } = message.payload || {};
+            if (!pairing_code) {
+              ws.send(
+                JSON.stringify({
+                  type: 'pairing_failed',
+                  payload: {
+                    error: 'Pairing code is required',
+                  },
+                })
+              );
+              return;
+            }
+
+            try {
+              const { linkedUserId, success } = await completePairing(
+                redis,
+                db,
+                pairing_code,
+                sessionState.userId,
+                sessionState.deviceId
+              );
+
+              if (success) {
+                // Update session state with new user ID
+                const oldUserId = sessionState.userId;
+                sessionState.userId = linkedUserId;
+
+                // Update Redis subscription to use new user ID
+                try {
+                  // Close old subscriber
+                  const oldSubscriber = subscribers.get(ws);
+                  if (oldSubscriber) {
+                    await oldSubscriber.unsubscribe();
+                    oldSubscriber.disconnect();
+                    activeSubscriberCount--;
+                    setGauge('redis_subscribers_active', activeSubscriberCount);
+                  }
+
+                  // Subscribe to new channel with linked user ID
+                  const newSubscriber = await subscribeToDeviceChannel(
+                    redis,
+                    linkedUserId,
+                    sessionState.deviceId,
+                    ws
+                  );
+                  subscribers.set(ws, newSubscriber);
+                  activeSubscriberCount++;
+                  setGauge('redis_subscribers_active', activeSubscriberCount);
+
+                  logger.info('Redis subscription updated after pairing', {
+                    oldUserId: oldUserId.substring(0, 12) + '...',
+                    newUserId: linkedUserId.substring(0, 12) + '...',
+                    deviceId: sessionState.deviceId,
+                  });
+                } catch (subscriptionError) {
+                  logger.warn('Failed to update Redis subscription after pairing', {
+                    linkedUserId: linkedUserId.substring(0, 12) + '...',
+                    deviceId: sessionState.deviceId,
+                  }, subscriptionError);
+                  // Continue anyway - may work in degraded mode
+                }
+
+                // Update session manager to move session to new user
+                try {
+                  // Remove session from old user
+                  sessionManager.removeSession(oldUserId, sessionState.deviceId);
+                  // Add session under new user (linked user)
+                  sessionManager.addSession(linkedUserId, sessionState.deviceId, sessionState, ws);
+                  
+                  logger.info('Session manager updated after pairing', {
+                    oldUserId: oldUserId.substring(0, 12) + '...',
+                    newUserId: linkedUserId.substring(0, 12) + '...',
+                    deviceId: sessionState.deviceId,
+                  });
+                } catch (sessionError) {
+                  logger.warn('Failed to update session manager after pairing', {
+                    linkedUserId: linkedUserId.substring(0, 12) + '...',
+                    deviceId: sessionState.deviceId,
+                  }, sessionError);
+                }
+
+                // Send confirmation to this device
+                ws.send(
+                  JSON.stringify({
+                    type: 'pairing_completed',
+                    payload: {
+                      success: true,
+                      linkedUserId,
+                    },
+                  })
+                );
+
+                // Broadcast pairing notification to all other devices of the new user
+                try {
+                  await deviceRelay.broadcastSystemMessage(
+                    linkedUserId,
+                    {
+                      type: 'device_paired',
+                      payload: {
+                        type: 'device_paired',
+                        device_id: sessionState.deviceId,
+                        timestamp: Date.now(),
+                      },
+                    },
+                    sessionState.deviceId
+                  );
+                } catch (broadcastError) {
+                  logger.warn('Failed to broadcast pairing notification', {
+                    linkedUserId: linkedUserId.substring(0, 12) + '...',
+                  }, broadcastError);
+                }
+
+                logger.info('Device paired successfully', {
+                  linkedUserId: linkedUserId.substring(0, 12) + '...',
+                  joiningDeviceId: sessionState.deviceId,
+                });
+              }
+            } catch (error) {
+              const errorMessage = error instanceof Error
+                ? error.message
+                : 'Failed to complete pairing';
+
+              logger.error('Pairing completion failed', {
+                userId: sessionState.userId.substring(0, 12) + '...',
+                deviceId: sessionState.deviceId,
+              }, error);
+
+              ws.send(
+                JSON.stringify({
+                  type: 'pairing_failed',
+                  payload: {
+                    error: errorMessage,
+                  },
+                })
+              );
+            }
           } else {
             logger.warn('Unknown message type', { type: message.type, clientId });
           }
@@ -902,6 +1099,20 @@ export function createWebSocketGateway(
             sessionState.deviceId,
             false
           );
+          await deviceRelay.broadcastSystemMessage(
+            sessionState.userId,
+            {
+              type: 'device_status_changed',
+              payload: {
+                type: 'device_status_changed',
+                user_id: sessionState.userId,
+                device_id: sessionState.deviceId,
+                is_online: false,
+                timestamp: Date.now(),
+              },
+            },
+            sessionState.deviceId
+          );
         } catch (error) {
           logger.warn(
             'Failed to publish device offline presence',
@@ -1014,7 +1225,9 @@ async function subscribeToDeviceChannel(
   deviceId: string,
   ws: WebSocket
 ): Promise<any> {
-  const channel = `user:${userId}:device:${deviceId}`;
+  // Subscribe to USER BROADCAST channel (Apple-like ecosystem)
+  // ALL devices of the same user share this channel for seamless sync
+  const channel = `user:${userId}:broadcast`;
 
   // Subscribe to Redis Pub/Sub
   const subscriber = redis.client.duplicate();
