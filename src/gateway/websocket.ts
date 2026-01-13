@@ -84,10 +84,10 @@ export function createWebSocketGateway(
   let activeSubscriberCount = 0;
 
   // Store handshake timeouts
-  const handshakeTimeouts = new WeakMap<WebSocket, NodeJS.Timeout>();
+  const handshakeTimeouts = new Map<WebSocket, NodeJS.Timeout>();
 
   // Store heartbeat intervals
-  const heartbeatIntervals = new WeakMap<WebSocket, NodeJS.Timeout>();
+  const heartbeatIntervals = new Map<WebSocket, NodeJS.Timeout>();
 
   // Store last pong time per connection
   const lastPongTime = new WeakMap<WebSocket, number>();
@@ -754,9 +754,9 @@ export function createWebSocketGateway(
     // Handle connection close
     ws.on('close', async () => {
       // Cleanup handshake timeout
-      const timeout = handshakeTimeouts.get(ws);
-      if (timeout) {
-        clearTimeout(timeout);
+      const handshakeTimeout = handshakeTimeouts.get(ws);
+      if (handshakeTimeout) {
+        clearTimeout(handshakeTimeout);
         handshakeTimeouts.delete(ws);
       }
 
@@ -816,11 +816,11 @@ export function createWebSocketGateway(
         subscribers.delete(ws);
       }
 
-      // Cleanup handshake timeout
-      const timeout = handshakeTimeouts.get(ws);
-      if (timeout) {
-        clearTimeout(timeout);
-        handshakeTimeouts.delete(ws);
+      // Cleanup heartbeat interval if still active
+      const heartbeatTimeoutCheck = heartbeatIntervals.get(ws);
+      if (heartbeatTimeoutCheck) {
+        clearInterval(heartbeatTimeoutCheck);
+        heartbeatIntervals.delete(ws);
       }
 
       if (sessionState) {
@@ -978,12 +978,12 @@ export function createWebSocketGateway(
     logger.debug('Session timeout interval cleared');
     
     // Also clear all active handshake timeouts
-    handshakeTimeouts.forEach((timeout) => {
+    handshakeTimeouts.forEach((timeout: NodeJS.Timeout) => {
       clearTimeout(timeout);
     });
     
     // Clear all active heartbeat intervals
-    heartbeatIntervals.forEach((interval) => {
+    heartbeatIntervals.forEach((interval: NodeJS.Timeout) => {
       clearInterval(interval);
     });
   };
