@@ -661,6 +661,20 @@ export function createWebSocketGateway(
 
             // Update session in Redis (refresh TTL)
             await updateSession(redis, sessionState);
+          } else if (message.type === 'ping') {
+            // Respond to heartbeat ping with pong
+            try {
+              ws.send(
+                JSON.stringify({
+                  type: 'pong',
+                  payload: { timestamp: Date.now() },
+                })
+              );
+            } catch (error) {
+              logger.debug('Failed to send pong response', {
+                deviceId: sessionState.deviceId,
+              });
+            }
           } else if (message.type === 'replay_request') {
             await handleReplayRequest(message as ReplayRequest, sessionState, db, ws);
           } else if (message.type === 'ack') {
