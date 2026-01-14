@@ -154,12 +154,25 @@ router.get('/devices', async (req: Request, res: Response) => {
           registeredAtTimestamp = undefined;
         }
 
+        // Determine online status: Check sessionsMap first (live connection),
+        // then fall back to database value for devices that have connected but
+        // WebSocket might be momentarily disconnected or handshake not yet complete
+        let isOnline = false;
+        if (sessionsMap && sessionsMap.has(deviceIdStr)) {
+          // Device has active WebSocket connection
+          isOnline = true;
+        } else if (row.is_online === true) {
+          // Device was marked online in database (from handshake or last connection)
+          // This handles cases where device is mid-handshake or just connected
+          isOnline = true;
+        }
+
         return {
           device_id: deviceIdStr,
           device_name: row.device_name || undefined,
           device_type: deviceType,
           device_os: row.device_os || undefined,
-          is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
+          is_online: isOnline,
           last_seen: lastSeenTimestamp,
           registered_at: registeredAtTimestamp,
           ip_address: row.ip_address ? String(row.ip_address) : undefined,
@@ -305,12 +318,23 @@ router.get('/devices/:deviceId', async (req: Request, res: Response) => {
       ? device.device_id 
       : device.device_id?.toString() || String(device.device_id);
     
+    // Determine online status: Check sessionsMap first (live connection),
+    // then fall back to database value
+    let isOnline = false;
+    if (sessionsMap && sessionsMap.has(deviceIdStr)) {
+      // Device has active WebSocket connection
+      isOnline = true;
+    } else if (device.is_online === true) {
+      // Device was marked online in database
+      isOnline = true;
+    }
+    
     res.json({
       device_id: deviceIdStr,
       device_name: device.device_name || undefined,
       device_type: device.device_type || undefined,
       device_os: device.device_os || undefined,
-      is_online: sessionsMap ? sessionsMap.has(deviceIdStr) : false,
+      is_online: isOnline,
       last_seen: new Date(device.last_seen).getTime(),
       registered_at: new Date(device.registered_at).getTime(),
     });
@@ -504,19 +528,32 @@ router.get('/presence', async (req: Request, res: Response) => {
     );
 
     const result = await database.pool.query(
-      `SELECT device_id, device_name, last_seen
+      `SELECT device_id, device_name, last_seen, is_online
        FROM user_devices
        WHERE user_id = $1
        ORDER BY last_seen DESC`,
       [userId]
     );
 
-    const devices = result.rows.map((row: any) => ({
-      device_id: row.device_id,
-      device_name: row.device_name,
-      is_online: sessionsMap ? sessionsMap.has(row.device_id) : false,
-      last_seen: new Date(row.last_seen).getTime(),
-    }));
+    const devices = result.rows.map((row: any) => {
+      // Determine online status: Check sessionsMap first (live connection),
+      // then fall back to database value
+      let isOnline = false;
+      if (sessionsMap && sessionsMap.has(row.device_id)) {
+        // Device has active WebSocket connection
+        isOnline = true;
+      } else if (row.is_online === true) {
+        // Device was marked online in database
+        isOnline = true;
+      }
+      
+      return {
+        device_id: row.device_id,
+        device_name: row.device_name,
+        is_online: isOnline,
+        last_seen: new Date(row.last_seen).getTime(),
+      };
+    });
 
     // Handle empty state
     const is_empty = devices.length === 0;

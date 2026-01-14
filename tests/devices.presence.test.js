@@ -20,6 +20,7 @@ class FakeDB {
                 last_seen: new Date(),
                 registered_at: new Date(),
                 ip_address: '127.0.0.1',
+                is_online: true,
                 user_id: userId,
               },
               {
@@ -30,6 +31,7 @@ class FakeDB {
                 last_seen: new Date(),
                 registered_at: new Date(),
                 ip_address: '127.0.0.1',
+                is_online: false,
                 user_id: userId,
               },
             ],
@@ -46,6 +48,7 @@ class FakeDB {
                 last_seen: new Date(),
                 registered_at: new Date(),
                 ip_address: '127.0.0.1',
+                is_online: true,
                 user_id: params[1],
               },
             ],

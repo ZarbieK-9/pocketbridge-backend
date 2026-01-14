@@ -692,7 +692,7 @@ async function runAllTests() {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
   
   try {
-    const result = await testPairingAndSync();
+    const result = await runTest();
     testResults.push({ name: 'Device Pairing & Sync', passed: result });
   } catch (error) {
     console.error('Test 1 failed with error:', error.message);
@@ -731,13 +731,8 @@ async function runAllTests() {
 // MAIN ENTRY POINT
 // ============================================================================
 
-if (require.main === module) {
-  runAllTests().catch((error) => {
-    console.error('\n❌ FATAL ERROR\n');
-    console.error(error);
-    process.exit(1);
-  });
-}
-
-// Run the test
-await runTest();
+runAllTests().catch((error) => {
+  console.error('\n❌ FATAL ERROR\n');
+  console.error(error);
+  process.exit(1);
+});
