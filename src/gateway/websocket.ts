@@ -17,6 +17,7 @@
  * - Timeouts
  */
 
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Database } from '../db/postgres.js';
 import type { RedisConnection } from '../db/redis.js';
@@ -663,6 +664,23 @@ export function createWebSocketGateway(
             // RELAY: Automatically relay event to all other devices of the same user
             await handleEvent(message.payload, sessionState, db, redis, deviceRelay);
 
+            // Send ACK back to sender to confirm event was processed (or was a duplicate)
+            // This allows the client to clean up its pending queue
+            try {
+              const eventPayload = message.payload as { device_seq?: number };
+              if (eventPayload.device_seq !== undefined) {
+                ws.send(JSON.stringify({
+                  type: 'ack',
+                  payload: { device_seq: eventPayload.device_seq },
+                }));
+              }
+            } catch (ackError) {
+              logger.debug('Failed to send ACK', {
+                deviceId: sessionState.deviceId,
+                error: ackError instanceof Error ? ackError.message : String(ackError),
+              });
+            }
+
             // Check if keys should be rotated (based on session age)
             // Note: Event count tracking would require additional state management
             // For now, we rotate based on session age (24 hours)
@@ -742,13 +760,13 @@ export function createWebSocketGateway(
             }
           } else if (message.type === 'complete_pairing') {
             // Device completes pairing - verifies code and links to initiating user
-            const { pairing_code } = message.payload || {};
-            if (!pairing_code) {
+            const pairingCode = message.payload?.pairing_code;
+            if (!pairingCode || typeof pairingCode !== 'string' || !/^\d{6}$/.test(pairingCode)) {
               ws.send(
                 JSON.stringify({
                   type: 'pairing_failed',
                   payload: {
-                    error: 'Pairing code is required',
+                    error: 'Invalid pairing code format',
                   },
                 })
               );
@@ -759,20 +777,40 @@ export function createWebSocketGateway(
               const { linkedUserId, success } = await completePairing(
                 redis,
                 db,
-                pairing_code,
+                pairingCode,
                 sessionState.userId,
                 sessionState.deviceId
               );
 
               if (success) {
-                // Update session state with new user ID
+                // ATOMIC SESSION STATE UPDATE with rollback capability
+                // CRITICAL: We defer updating sessionState.userId until ALL operations succeed
+                // This prevents messages being processed with wrong userId during the transition
                 const oldUserId = sessionState.userId;
-                sessionState.userId = linkedUserId;
+                let subscriptionUpdated = false;
+                let sessionManagerUpdated = false;
+                let oldSubscriber: ReturnType<typeof subscribers.get> | null = null;
+                let newSubscriber: Awaited<ReturnType<typeof subscribeToDeviceChannel>> | null = null;
 
-                // Update Redis subscription to use new user ID
                 try {
-                  // Close old subscriber
-                  const oldSubscriber = subscribers.get(ws);
+                  // Step 1: Update Redis subscription
+                  // IMPORTANT: Subscribe to NEW channel BEFORE unsubscribing from OLD channel
+                  // This ensures no events are lost during the transition (we may receive duplicates briefly,
+                  // but that's better than losing events)
+                  oldSubscriber = subscribers.get(ws) || null;
+
+                  // First, subscribe to new channel (now subscribed to both)
+                  newSubscriber = await subscribeToDeviceChannel(
+                    redis,
+                    linkedUserId,
+                    sessionState.deviceId,
+                    ws
+                  );
+                  // Don't update subscribers map yet - wait until old subscription is cleaned up
+                  activeSubscriberCount++;
+                  setGauge('redis_subscribers_active', activeSubscriberCount);
+
+                  // Now, unsubscribe from old channel (subscribed only to new)
                   if (oldSubscriber) {
                     await oldSubscriber.unsubscribe();
                     oldSubscriber.disconnect();
@@ -780,93 +818,145 @@ export function createWebSocketGateway(
                     setGauge('redis_subscribers_active', activeSubscriberCount);
                   }
 
-                  // Subscribe to new channel with linked user ID
-                  const newSubscriber = await subscribeToDeviceChannel(
-                    redis,
-                    linkedUserId,
-                    sessionState.deviceId,
-                    ws
-                  );
+                  // Update subscribers map to new subscriber
                   subscribers.set(ws, newSubscriber);
-                  activeSubscriberCount++;
-                  setGauge('redis_subscribers_active', activeSubscriberCount);
+                  subscriptionUpdated = true;
 
                   logger.info('Redis subscription updated after pairing', {
                     oldUserId: oldUserId.substring(0, 12) + '...',
                     newUserId: linkedUserId.substring(0, 12) + '...',
                     deviceId: sessionState.deviceId,
                   });
-                } catch (subscriptionError) {
-                  logger.warn('Failed to update Redis subscription after pairing', {
-                    linkedUserId: linkedUserId.substring(0, 12) + '...',
-                    deviceId: sessionState.deviceId,
-                  }, subscriptionError);
-                  // Continue anyway - may work in degraded mode
-                }
 
-                // Update session manager to move session to new user
-                try {
-                  // Remove session from old user
-                  sessionManager.removeSession(oldUserId, sessionState.deviceId);
-                  // Add session under new user (linked user)
-                  sessionManager.addSession(linkedUserId, sessionState.deviceId, sessionState, ws);
-                  
+                  // Step 2: Update sessionState BEFORE session manager transfer
+                  // This ensures the sessionState has the correct userId when added to the new user's sessions
+                  sessionState.userId = linkedUserId;
+                  // CRITICAL: Reset lastAckDeviceSeq to 0 to match DB state after pairing
+                  // The DB was reset to 0 in completePairing, so in-memory state must match
+                  // Otherwise client events will fail "Device sequence not monotonic" check
+                  sessionState.lastAckDeviceSeq = 0;
+
+                  // Step 3: Atomically transfer session from old user to new user
+                  // This prevents a gap where the device isn't in any session list
+                  sessionManager.transferSession(oldUserId, linkedUserId, sessionState.deviceId, sessionState, ws);
+                  sessionManagerUpdated = true;
+
                   logger.info('Session manager updated after pairing', {
                     oldUserId: oldUserId.substring(0, 12) + '...',
                     newUserId: linkedUserId.substring(0, 12) + '...',
                     deviceId: sessionState.deviceId,
                   });
-                } catch (sessionError) {
-                  logger.warn('Failed to update session manager after pairing', {
+
+                  // All updates successful - send confirmation
+                  ws.send(
+                    JSON.stringify({
+                      type: 'pairing_completed',
+                      payload: {
+                        success: true,
+                        linkedUserId,
+                      },
+                    })
+                  );
+
+                  // Broadcast pairing notification to all other devices of the new user
+                  try {
+                    await deviceRelay.broadcastSystemMessage(
+                      linkedUserId,
+                      {
+                        type: 'device_paired',
+                        payload: {
+                          type: 'device_paired',
+                          device_id: sessionState.deviceId,
+                          timestamp: Date.now(),
+                        },
+                      },
+                      sessionState.deviceId
+                    );
+                  } catch (broadcastError) {
+                    logger.warn('Failed to broadcast pairing notification', {
+                      linkedUserId: linkedUserId.substring(0, 12) + '...',
+                    }, broadcastError);
+                  }
+
+                  logger.info('Device paired successfully', {
+                    linkedUserId: linkedUserId.substring(0, 12) + '...',
+                    joiningDeviceId: sessionState.deviceId,
+                  });
+                } catch (updateError) {
+                  // ROLLBACK: Revert all changes on failure
+                  logger.error('Session update failed after pairing, rolling back', {
+                    oldUserId: oldUserId.substring(0, 12) + '...',
                     linkedUserId: linkedUserId.substring(0, 12) + '...',
                     deviceId: sessionState.deviceId,
-                  }, sessionError);
-                }
+                    subscriptionUpdated,
+                    sessionManagerUpdated,
+                    sessionUserIdChanged: sessionState.userId !== oldUserId,
+                  }, updateError);
 
-                // Send confirmation to this device
-                ws.send(
-                  JSON.stringify({
-                    type: 'pairing_completed',
-                    payload: {
-                      success: true,
-                      linkedUserId,
-                    },
-                  })
-                );
+                  // Rollback session manager if it was updated (transfer back to old user)
+                  if (sessionManagerUpdated) {
+                    try {
+                      // Revert sessionState.userId first
+                      sessionState.userId = oldUserId;
+                      // Transfer session back atomically
+                      sessionManager.transferSession(linkedUserId, oldUserId, sessionState.deviceId, sessionState, ws);
+                    } catch (rollbackError) {
+                      logger.error('Failed to rollback session manager', {}, rollbackError);
+                      // Still try to revert sessionState.userId even if transfer failed
+                      sessionState.userId = oldUserId;
+                    }
+                  } else if (sessionState.userId !== oldUserId) {
+                    // sessionState.userId was changed but transfer wasn't complete
+                    sessionState.userId = oldUserId;
+                  }
 
-                // Broadcast pairing notification to all other devices of the new user
-                try {
-                  await deviceRelay.broadcastSystemMessage(
-                    linkedUserId,
-                    {
-                      type: 'device_paired',
+                  // Rollback subscription if it was updated
+                  if (subscriptionUpdated) {
+                    try {
+                      const currentSubscriber = subscribers.get(ws);
+                      if (currentSubscriber) {
+                        await currentSubscriber.unsubscribe();
+                        currentSubscriber.disconnect();
+                        activeSubscriberCount--;
+                      }
+                      // Re-subscribe to old channel
+                      const restoredSubscriber = await subscribeToDeviceChannel(
+                        redis,
+                        oldUserId,
+                        sessionState.deviceId,
+                        ws
+                      );
+                      subscribers.set(ws, restoredSubscriber);
+                      activeSubscriberCount++;
+                      setGauge('redis_subscribers_active', activeSubscriberCount);
+                    } catch (rollbackError) {
+                      logger.error('Failed to rollback Redis subscription', {}, rollbackError);
+                    }
+                  }
+
+                  // Send failure message to client
+                  ws.send(
+                    JSON.stringify({
+                      type: 'pairing_failed',
                       payload: {
-                        type: 'device_paired',
-                        device_id: sessionState.deviceId,
-                        timestamp: Date.now(),
+                        error: 'Failed to update session state after pairing. Please try again.',
                       },
-                    },
-                    sessionState.deviceId
+                    })
                   );
-                } catch (broadcastError) {
-                  logger.warn('Failed to broadcast pairing notification', {
-                    linkedUserId: linkedUserId.substring(0, 12) + '...',
-                  }, broadcastError);
+                  return;
                 }
-
-                logger.info('Device paired successfully', {
-                  linkedUserId: linkedUserId.substring(0, 12) + '...',
-                  joiningDeviceId: sessionState.deviceId,
-                });
               }
             } catch (error) {
               const errorMessage = error instanceof Error
-                ? error.message
+                ? (error.message || 'Failed to complete pairing')
                 : 'Failed to complete pairing';
 
-              logger.error('Pairing completion failed', {
+              logger.error(`Pairing completion failed: ${errorMessage}`, {
                 userId: sessionState.userId.substring(0, 12) + '...',
                 deviceId: sessionState.deviceId,
+                pairingCode,
+                errorType: error instanceof Error ? error.constructor.name : typeof error,
+                errorMessage,
               }, error);
 
               ws.send(
@@ -905,6 +995,17 @@ export function createWebSocketGateway(
         // Add stack trace (always log it, but don't expose to client)
         if (err.stack) {
           messageContext.stack = err.stack;
+        }
+
+        // Graceful handling: device record missing (deleted or moved). Close quietly to avoid log spam.
+        if (err instanceof ValidationError && err.message === 'Device not found or has been deleted') {
+          logger.warn('Closing session because device is missing', {
+            clientId,
+            deviceId: sessionState?.deviceId,
+            userId: sessionState?.userId?.substring(0, 12) + '...',
+          });
+          ws.close(1008, err.message);
+          return;
         }
 
         // Log error with full details (for debugging)
@@ -1284,6 +1385,90 @@ async function updatePresence(redis: RedisConnection, deviceId: string, isOnline
 }
 
 /**
+ * Create HMAC-signed continuation token
+ * Token is bound to device_id to prevent cross-device token reuse
+ */
+function createContinuationToken(deviceSeq: number, deviceId: string): string {
+  const tokenData = {
+    device_seq: deviceSeq,
+    device_id: deviceId,
+    timestamp: Date.now(),
+  };
+  const payload = JSON.stringify(tokenData);
+
+  // Sign with server private key (or use a dedicated secret from config)
+  const secret = config.serverIdentity?.privateKeyHex || 'default-continuation-token-secret';
+  const signature = crypto
+    .createHmac('sha256', secret)
+    .update(payload)
+    .digest('hex');
+
+  // Token format: base64(payload).signature
+  const payloadBase64 = Buffer.from(payload).toString('base64');
+  return `${payloadBase64}.${signature}`;
+}
+
+/**
+ * Verify and parse HMAC-signed continuation token
+ * Returns null if token is invalid, tampered, or for a different device
+ */
+function parseContinuationToken(
+  token: string,
+  deviceId: string
+): { device_seq: number; timestamp: number } | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 2) {
+      return null;
+    }
+
+    const [payloadBase64, providedSignature] = parts;
+    const payload = Buffer.from(payloadBase64, 'base64').toString('utf8');
+
+    // Verify signature
+    const secret = config.serverIdentity?.privateKeyHex || 'default-continuation-token-secret';
+    const expectedSignature = crypto
+      .createHmac('sha256', secret)
+      .update(payload)
+      .digest('hex');
+
+    // Use timing-safe comparison to prevent timing attacks
+    if (!crypto.timingSafeEqual(
+      Buffer.from(providedSignature, 'hex'),
+      Buffer.from(expectedSignature, 'hex')
+    )) {
+      return null;
+    }
+
+    const parsed = JSON.parse(payload);
+
+    // Verify token is for this device (prevents cross-device token reuse)
+    if (parsed.device_id !== deviceId) {
+      return null;
+    }
+
+    // Verify required fields
+    if (typeof parsed.device_seq !== 'number' || typeof parsed.timestamp !== 'number') {
+      return null;
+    }
+
+    // Optional: Reject tokens older than 1 hour (prevents token replay attacks)
+    const tokenAge = Date.now() - parsed.timestamp;
+    const maxTokenAge = 60 * 60 * 1000; // 1 hour
+    if (tokenAge > maxTokenAge) {
+      return null;
+    }
+
+    return {
+      device_seq: parsed.device_seq,
+      timestamp: parsed.timestamp,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Handle replay request with window enforcement and size limits
  */
 async function handleReplayRequest(
@@ -1297,18 +1482,12 @@ async function handleReplayRequest(
   // Parse continuation token if provided (contains the device_seq to continue from)
   let startDeviceSeq = last_ack_device_seq;
   if (continuation_token) {
-    try {
-      const decoded = Buffer.from(continuation_token, 'base64').toString('utf8');
-      const parsed = JSON.parse(decoded);
-      if (parsed.device_seq && typeof parsed.device_seq === 'number') {
-        startDeviceSeq = parsed.device_seq;
-      } else {
-        throw new Error('Invalid continuation token format');
-      }
-    } catch (error) {
-      logger.warn('Invalid continuation token, using last_ack_device_seq', {
+    const tokenData = parseContinuationToken(continuation_token, sessionState.deviceId);
+    if (tokenData) {
+      startDeviceSeq = tokenData.device_seq;
+    } else {
+      logger.warn('Invalid or tampered continuation token, using last_ack_device_seq', {
         deviceId: sessionState.deviceId,
-        error: error instanceof Error ? error.message : String(error),
       });
       startDeviceSeq = last_ack_device_seq;
     }
@@ -1397,16 +1576,12 @@ async function handleReplayRequest(
     created_at: new Date(row.created_at).getTime(),
   }));
 
-  // Generate continuation token if there are more events
+  // Generate HMAC-signed continuation token if there are more events
   let continuationToken: string | undefined;
   if (hasMore && events.length > 0) {
-    // Token contains the device_seq of the last event returned
     const lastEvent = events[events.length - 1];
-    const tokenData = {
-      device_seq: lastEvent.device_seq,
-      timestamp: Date.now(),
-    };
-    continuationToken = Buffer.from(JSON.stringify(tokenData)).toString('base64');
+    // Use signed token to prevent tampering and cross-device reuse
+    continuationToken = createContinuationToken(lastEvent.device_seq, sessionState.deviceId);
   }
 
   // Edge case: No events to replay
@@ -1459,19 +1634,35 @@ async function handleReplayRequest(
 
 /**
  * Handle acknowledgment
+ *
+ * NOTE: ACKs are sent by clients when they RECEIVE events from other devices.
+ * The device_seq in the ACK is the SENDER's device_seq, not the ACK sender's.
+ *
+ * IMPORTANT: We do NOT update last_ack_device_seq based on ACKs because:
+ * 1. The device_seq in ACKs is from a different device (the event sender)
+ * 2. last_ack_device_seq tracks THIS device's sent event sequence
+ * 3. Mixing these values causes "Device sequence not monotonic" errors
+ *
+ * Instead, last_ack_device_seq is updated in handleEvent when events are sent.
  */
 async function handleAck(
   ack: { device_seq: number },
   sessionState: SessionState,
   db: Database
 ): Promise<void> {
-  // Update last_ack_device_seq
-  await db.pool.query(
-    `UPDATE user_devices 
-     SET last_ack_device_seq = $1, last_seen = NOW()
-     WHERE device_id = $2::uuid`,
-    [ack.device_seq, sessionState.deviceId]
-  );
+  // ACKs are informational only - they tell us the client received an event
+  // We log this for debugging but do NOT update last_ack_device_seq
+  // because the device_seq in the ACK is from the event sender, not this device
+  logger.debug('Received ACK for event', {
+    deviceId: sessionState.deviceId,
+    ackDeviceSeq: ack.device_seq,
+    sessionLastAckDeviceSeq: sessionState.lastAckDeviceSeq,
+    note: 'ACK device_seq is from event sender, not updating this device\'s last_ack_device_seq',
+  });
 
-  sessionState.lastAckDeviceSeq = ack.device_seq;
+  // Update last_seen timestamp only (not last_ack_device_seq)
+  await db.pool.query(
+    `UPDATE user_devices SET last_seen = NOW() WHERE device_id = $1::uuid`,
+    [sessionState.deviceId]
+  );
 }

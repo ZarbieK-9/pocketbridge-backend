@@ -12,6 +12,7 @@ import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
 import { verifyEd25519 } from '../crypto/utils.js';
 import { sanitizeDeviceName } from '../utils/validation.js';
+import crypto from 'crypto';
 import type { Database } from '../db/postgres.js';
 
 let database: Database | null = null;
@@ -27,7 +28,6 @@ const router = Router();
  * Must match client-side hashing
  */
 function hashForSignature(...parts: string[]): Buffer {
-  const crypto = require('crypto');
   const combined = parts.join('');
   return crypto.createHash('sha256').update(combined, 'utf8').digest();
 }
@@ -349,11 +349,14 @@ router.post('/user/profile', async (req: Request, res: Response) => {
       return res.status(400).json({ error: error.message });
     }
 
-    logger.error(
-      'Failed to update user profile',
-      {},
-      error instanceof Error ? error : new Error(String(error))
-    );
+    const errorDetails = {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      userId: (req as any).userId?.substring(0, 16) + '...',
+    };
+    
+    console.error('[USER_PROFILE_UPDATE_ERROR]', errorDetails);
+    logger.error('Failed to update user profile', errorDetails);
     res.status(500).json({ error: 'Failed to update user profile' });
   }
 });
@@ -425,11 +428,14 @@ router.post('/user/profile/onboarding-complete', async (req: Request, res: Respo
 
     res.json({ success: true });
   } catch (error) {
-    logger.error(
-      'Failed to mark onboarding as complete',
-      {},
-      error instanceof Error ? error : new Error(String(error))
-    );
+    const errorDetails = {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      userId: (req as any).userId?.substring(0, 16) + '...',
+    };
+    
+    console.error('[ONBOARDING_COMPLETE_ERROR]', errorDetails);
+    logger.error('Failed to mark onboarding as complete', errorDetails);
     res.status(500).json({ error: 'Failed to mark onboarding as complete' });
   }
 });

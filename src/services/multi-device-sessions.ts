@@ -75,6 +75,49 @@ export class MultiDeviceSessionManager {
   }
 
   /**
+   * Atomically transfer a session from one user to another
+   * This prevents the gap where a device isn't in any session list (which could cause broadcasts to fail)
+   */
+  transferSession(
+    fromUserId: string,
+    toUserId: string,
+    deviceId: string,
+    sessionState: SessionState,
+    ws: WebSocket
+  ): boolean {
+    // Step 1: Add to new user FIRST (device now exists in both)
+    if (!this.sessions.has(toUserId)) {
+      this.sessions.set(toUserId, {});
+    }
+    const toUserSessions = this.sessions.get(toUserId)!;
+    toUserSessions[deviceId] = sessionState;
+
+    // Step 2: Update WebSocket mapping to new key
+    const oldWsKey = `${fromUserId}:${deviceId}`;
+    const newWsKey = `${toUserId}:${deviceId}`;
+    this.sessionWebSockets.delete(oldWsKey);
+    this.sessionWebSockets.set(newWsKey, ws);
+
+    // Step 3: Remove from old user (device now only exists in new user's list)
+    const fromUserSessions = this.sessions.get(fromUserId);
+    if (fromUserSessions) {
+      delete fromUserSessions[deviceId];
+      if (Object.keys(fromUserSessions).length === 0) {
+        this.sessions.delete(fromUserId);
+      }
+    }
+
+    logger.info('Session transferred', {
+      fromUserId: fromUserId.substring(0, 16) + '...',
+      toUserId: toUserId.substring(0, 16) + '...',
+      deviceId,
+      toUserDeviceCount: Object.keys(toUserSessions).length,
+    });
+
+    return true;
+  }
+
+  /**
    * Get session by user and device
    */
   getSession(userId: string, deviceId: string): SessionState | null {

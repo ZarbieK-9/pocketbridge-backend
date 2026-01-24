@@ -10,11 +10,13 @@ import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
 import type { SessionState, ConnectionStatus } from '../types/index.js';
 import type { Database } from '../db/postgres.js';
+import type { RedisConnection } from '../db/redis.js';
 import { config } from '../config.js';
 
 // Store reference to sessions Map from WebSocket gateway
 let sessionsMap: Map<string, SessionState> | null = null;
 let database: Database | null = null;
+let redisConnection: RedisConnection | null = null;
 
 export function setSessionsMap(sessions: Map<string, SessionState>): void {
   sessionsMap = sessions;
@@ -22,6 +24,10 @@ export function setSessionsMap(sessions: Map<string, SessionState>): void {
 
 export function setDatabase(db: Database): void {
   database = db;
+}
+
+export function setRedis(redis: RedisConnection): void {
+  redisConnection = redis;
 }
 
 const router = Router();
@@ -110,6 +116,65 @@ router.get('/connection-status', async (req: Request, res: Response) => {
     } else {
       res.status(500).json({ error: 'Failed to get connection status' });
     }
+  }
+});
+
+/**
+ * Health check endpoint
+ * GET /api/health
+ */
+router.get('/health', async (req: Request, res: Response) => {
+  try {
+    const health: {
+      status: string;
+      timestamp: number;
+      version: string;
+      database?: string;
+      redis?: string;
+    } = {
+      status: 'healthy',
+      timestamp: Date.now(),
+      version: process.env.npm_package_version || '1.0.0',
+    };
+
+    // Check database connectivity
+    if (database) {
+      try {
+        await database.pool.query('SELECT 1');
+        health.database = 'connected';
+      } catch (error) {
+        logger.error('Database health check failed', {}, error instanceof Error ? error : new Error(String(error)));
+        health.database = 'error';
+        health.status = 'degraded';
+      }
+    } else {
+      health.database = 'not_initialized';
+      health.status = 'degraded';
+    }
+
+    // Check Redis connectivity
+    if (redisConnection) {
+      try {
+        await redisConnection.healthCheck();
+        health.redis = 'connected';
+      } catch (error) {
+        logger.error('Redis health check failed', {}, error instanceof Error ? error : new Error(String(error)));
+        health.redis = 'error';
+        health.status = 'degraded';
+      }
+    } else {
+      health.redis = 'not_initialized';
+    }
+
+    const statusCode = health.status === 'healthy' ? 200 : 503;
+    res.status(statusCode).json(health);
+  } catch (error) {
+    logger.error('Health check failed', {}, error instanceof Error ? error : new Error(String(error)));
+    res.status(503).json({
+      status: 'error',
+      timestamp: Date.now(),
+      error: error instanceof Error ? error.message : 'Health check failed',
+    });
   }
 });
 

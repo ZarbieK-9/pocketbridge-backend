@@ -156,9 +156,42 @@ export async function handleEvent(
     throw new ValidationError('Event device_id mismatch');
   }
 
-  // Validate device_seq is monotonic
-  if (encryptedEvent.device_seq <= sessionState.lastAckDeviceSeq) {
-    throw new ValidationError('Device sequence not monotonic');
+  // Validate device_seq hasn't been processed yet
+  // Use a set to track processed sequences to handle out-of-order delivery
+  // Initialize the set if it doesn't exist
+  if (!sessionState.processedDeviceSeqs) {
+    sessionState.processedDeviceSeqs = new Set<number>();
+    // Add all sequences up to lastAckDeviceSeq as already processed
+    for (let i = 1; i <= sessionState.lastAckDeviceSeq; i++) {
+      sessionState.processedDeviceSeqs.add(i);
+    }
+  }
+
+  // Check if this sequence was already processed (duplicate or replay attack)
+  if (sessionState.processedDeviceSeqs.has(encryptedEvent.device_seq)) {
+    logger.debug('Device sequence already processed (duplicate event, ignoring)', {
+      eventDeviceSeq: encryptedEvent.device_seq,
+      sessionLastAckDeviceSeq: sessionState.lastAckDeviceSeq,
+      processedSeqsSize: sessionState.processedDeviceSeqs.size,
+      deviceId: sessionState.deviceId,
+      userId: sessionState.userId?.substring(0, 16) + '...',
+      eventId: encryptedEvent.event_id,
+    });
+    // Return early without error - duplicate events are silently accepted
+    // The client will receive success (no error) and can clean up its queue
+    return;
+  }
+
+  // Mark this sequence as being processed
+  sessionState.processedDeviceSeqs.add(encryptedEvent.device_seq);
+
+  // Limit the set size to prevent memory issues (keep last 10000 sequences)
+  if (sessionState.processedDeviceSeqs.size > 10000) {
+    const seqsArray = Array.from(sessionState.processedDeviceSeqs).sort((a, b) => a - b);
+    const toRemove = seqsArray.slice(0, seqsArray.length - 5000);
+    for (const seq of toRemove) {
+      sessionState.processedDeviceSeqs.delete(seq);
+    }
   }
 
   // Assign stream_seq (get next sequence for this stream) with timeout and circuit breaker
@@ -223,6 +256,8 @@ export async function handleEvent(
 
   // Store event metadata in PostgreSQL with timeout and circuit breaker
   // Also update user activity timestamp in the same transaction
+  // IMPORTANT: Device existence check is done INSIDE the transaction to prevent race conditions
+  // where the device is deleted between validation and storage
   const storeStart = Date.now();
   try {
     await withTimeout(
@@ -230,6 +265,18 @@ export async function handleEvent(
         const client = await db.pool.connect();
         try {
           await client.query('BEGIN');
+
+          // Re-verify device exists INSIDE transaction (prevents race condition with device deletion)
+          // Use FOR SHARE to allow concurrent reads but prevent deletion during this transaction
+          const deviceCheckInTx = await client.query(
+            `SELECT device_id FROM user_devices
+             WHERE device_id = $1::uuid AND user_id = $2
+             FOR SHARE`,
+            [sessionState.deviceId, sessionState.userId]
+          );
+          if (deviceCheckInTx.rows.length === 0) {
+            throw new ValidationError('Device was deleted during event processing');
+          }
 
           // Update user last_activity timestamp
           await client.query(`UPDATE users SET last_activity = NOW() WHERE user_id = $1`, [
@@ -279,12 +326,47 @@ export async function handleEvent(
     throw error;
   }
 
+  // CRITICAL: Update lastAckDeviceSeq in session state after successful storage
+  // Use Math.max to handle out-of-order event processing (events may arrive in different order)
+  // Must happen BEFORE relaying to prevent race conditions
+  sessionState.lastAckDeviceSeq = Math.max(sessionState.lastAckDeviceSeq, encryptedEvent.device_seq);
+
+  // Also persist to DB so it's loaded correctly on reconnect
+  // Use GREATEST to prevent regression in case of concurrent updates
+  try {
+    await db.pool.query(
+      `UPDATE user_devices
+       SET last_ack_device_seq = GREATEST(last_ack_device_seq, $1)
+       WHERE device_id = $2::uuid`,
+      [encryptedEvent.device_seq, sessionState.deviceId]
+    );
+  } catch (dbError) {
+    // Log but don't fail the event - in-memory state is already updated
+    logger.warn('Failed to persist last_ack_device_seq to DB', {
+      deviceId: sessionState.deviceId,
+      deviceSeq: encryptedEvent.device_seq,
+      error: dbError instanceof Error ? dbError.message : String(dbError),
+    });
+  }
+
   // Create event with server-assigned stream_seq
   const routedEvent: EncryptedEvent = {
     ...encryptedEvent,
     stream_seq: streamSeq,
     created_at: Date.now(),
   };
+
+  // FILE EVENT TRACING: Log file events for debugging file transfer issues
+  if (routedEvent.type.startsWith('file:')) {
+    logger.info('FILE EVENT RECEIVED', {
+      eventType: routedEvent.type,
+      eventId: routedEvent.event_id,
+      streamId: routedEvent.stream_id,
+      senderDeviceId: sessionState.deviceId,
+      userId: sessionState.userId.substring(0, 16) + '...',
+      payloadSize: payloadSize,
+    });
+  }
 
   // RELAY: Automatically route event to all other devices of the same user
   // This is the core relay functionality - connects devices together

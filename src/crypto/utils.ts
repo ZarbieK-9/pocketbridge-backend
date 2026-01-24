@@ -284,8 +284,12 @@ export function computeECDHSecret(publicKeyHex: string, privateKeyHex: string): 
  *
  * HKDF(shared_secret, salt, info, length)
  * - salt: SHA256(client_ephemeral_pub || server_ephemeral_pub)
- * - info: "pocketbridge_session_v1"
+ * - info: direction-specific string to derive separate keys
  * - length: 32 bytes (AES-256)
+ *
+ * SECURITY: Derives separate keys for each direction to prevent reflection attacks.
+ * - clientKey: Key for client-to-server direction (server uses to decrypt FROM client)
+ * - serverKey: Key for server-to-client direction (server uses to encrypt TO client)
  */
 export function deriveSessionKeys(
   sharedSecret: Buffer,
@@ -299,23 +303,28 @@ export function deriveSessionKeys(
     .update(Buffer.from(serverEphemeralPub, 'hex'))
     .digest();
 
-  // Info = protocol identifier
-  const info = Buffer.from('pocketbridge_session_v1', 'utf8');
-
-  // HKDF extract
+  // HKDF extract (same PRK for both keys)
   const prk = crypto.createHmac('sha256', salt).update(sharedSecret).digest();
 
-  // HKDF expand (32 bytes = AES-256 key)
-  const hmac = crypto.createHmac('sha256', prk);
-  hmac.update(info);
-  hmac.update(Buffer.from([0x01])); // Counter
-  const sessionKey = hmac.digest();
+  // Derive client-to-server key (used by server to decrypt messages FROM client)
+  const clientToServerInfo = Buffer.from('pocketbridge_client_to_server_v1', 'utf8');
+  const clientKeyHmac = crypto.createHmac('sha256', prk);
+  clientKeyHmac.update(clientToServerInfo);
+  clientKeyHmac.update(Buffer.from([0x01])); // Counter
+  const clientKey = clientKeyHmac.digest();
+
+  // Derive server-to-client key (used by server to encrypt messages TO client)
+  const serverToClientInfo = Buffer.from('pocketbridge_server_to_client_v1', 'utf8');
+  const serverKeyHmac = crypto.createHmac('sha256', prk);
+  serverKeyHmac.update(serverToClientInfo);
+  serverKeyHmac.update(Buffer.from([0x01])); // Counter
+  const serverKey = serverKeyHmac.digest();
 
   return {
-    clientKey: sessionKey, // Same key for both directions (simplified)
-    serverKey: sessionKey,
-    clientKeyHex: sessionKey.toString('hex'),
-    serverKeyHex: sessionKey.toString('hex'),
+    clientKey,
+    serverKey,
+    clientKeyHex: clientKey.toString('hex'),
+    serverKeyHex: serverKey.toString('hex'),
   };
 }
 

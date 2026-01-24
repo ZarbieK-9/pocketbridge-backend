@@ -35,6 +35,9 @@ RUN npm ci --omit=dev && \
 # Copy built files from builder
 COPY --from=builder /app/dist ./dist
 
+# Copy migrations
+COPY migrations ./migrations
+
 # Change ownership to non-root user
 RUN chown -R nodejs:nodejs /app
 

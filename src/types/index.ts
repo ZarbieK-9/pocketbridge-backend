@@ -78,6 +78,8 @@ export interface SessionState {
   };
   lastAckDeviceSeq: number;
   createdAt: number;
+  /** Set of already processed device sequences to handle out-of-order delivery */
+  processedDeviceSeqs?: Set<number>;
 }
 
 /**

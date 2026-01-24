@@ -49,10 +49,11 @@ import { securityHeaders } from './middleware/security-headers.js';
 import { startTTLCleanupJob } from './jobs/ttl-cleanup.js';
 import { getMetrics } from './routes/metrics.js';
 import adminRouter, { setDatabase } from './routes/admin.js';
-import pairingRouter, { setDatabase as setPairingDatabase } from './routes/pairing.js';
+import pairingRouter, { setDatabase as setPairingDatabase, setRedis as setPairingRedis } from './routes/pairing.js';
 import statusRouter, {
   setSessionsMap as setStatusSessionsMap,
   setDatabase as setStatusDatabase,
+  setRedis as setStatusRedis,
 } from './routes/status.js';
 import devicesRouter, {
   setDatabase as setDevicesDatabase,
@@ -327,6 +328,12 @@ async function start() {
     // Initialize Redis
     redis = await initRedis();
     logger.info('Redis connected');
+
+    // Set Redis for pairing routes
+    setPairingRedis(redis);
+
+    // Set Redis for status routes
+    setStatusRedis(redis);
 
     // Create WebSocket gateway
     websocketSessionsMap = createWebSocketGateway(wss, { db, redis });

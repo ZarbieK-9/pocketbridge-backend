@@ -309,6 +309,23 @@ async function handleClientHello(
       nonceS
     );
 
+    // Emit debug to compare with client verification inputs
+    const signatureDataHex = signatureData.toString('hex');
+    const signatureLog = {
+      serverIdentityPubPrefix: serverIdentity.publicKeyHex?.substring(0, 16) + '...',
+      serverIdentityPubLength: serverIdentity.publicKeyHex?.length,
+      serverEphemeralPubPrefix: serverEphemeralKeypair.publicKey?.substring(0, 16) + '...',
+      serverEphemeralPubLength: serverEphemeralKeypair.publicKey?.length,
+      nonceCLength: message.nonce_c?.length,
+      nonceSLength: nonceS.length,
+      signatureDataHashPrefix: signatureDataHex.substring(0, 16) + '...',
+      signatureDataHashLength: signatureDataHex.length,
+      signatureDataHashFull: signatureDataHex,
+    };
+    logger.info('ServerHello signature inputs', signatureLog);
+    // Mirror to console for quick capture during debug sessions
+    console.error('[DEBUG] ServerHello signature inputs', signatureLog);
+
     // Use privateKeyHex if available, otherwise use privateKey (assuming hex format)
     const privateKeyHex = serverIdentity.privateKeyHex || serverIdentity.privateKey;
     if (!privateKeyHex) {
@@ -533,24 +550,64 @@ async function handleClientAuth(
 
     // Get or create device in multi-schema and get last_ack_device_seq
     // Include device_name and device_type if provided
+    // IMPORTANT: If device already exists (e.g., from pairing), preserve its current user_id
+    // so that paired devices stay linked to their paired user, not their own identity
+
+    // First check if this device already exists to get its current user_id
+    const existingDevice = await db.pool.query(
+      `SELECT user_id, device_name FROM user_devices WHERE device_id = $1::uuid`,
+      [message.device_id]
+    );
+    const targetUserId = existingDevice.rows[0]?.user_id || message.user_id;
+
+    // Check for device name conflicts and auto-rename if needed
+    let deviceName = message.device_name || null;
+    if (deviceName) {
+      const existingNames = await db.pool.query(
+        `SELECT device_name FROM user_devices WHERE user_id = $1 AND device_name IS NOT NULL AND device_id != $2::uuid`,
+        [targetUserId, message.device_id]
+      );
+      const existingNameSet = new Set(existingNames.rows.map((r: { device_name: string }) => r.device_name));
+
+      if (existingNameSet.has(deviceName)) {
+        // Find a unique name by appending a number suffix
+        const baseName = deviceName.replace(/\s*\(\d+\)$/, ''); // Remove existing suffix like " (2)"
+        let suffix = 2;
+        let newName = `${baseName} (${suffix})`;
+        while (existingNameSet.has(newName)) {
+          suffix++;
+          newName = `${baseName} (${suffix})`;
+        }
+        logger.info('Auto-renamed device due to name conflict', {
+          originalName: deviceName,
+          newName,
+          deviceId: message.device_id,
+        });
+        deviceName = newName;
+      }
+    }
+
     const deviceResult = await db.pool.query(
       `INSERT INTO user_devices (device_id, user_id, device_name, device_type, last_ack_device_seq, is_online, last_seen)
        VALUES ($1::uuid, $2, $3, $4, 0, TRUE, NOW())
        ON CONFLICT (device_id)
-       DO UPDATE SET 
-         last_seen = NOW(), 
+       DO UPDATE SET
+         last_seen = NOW(),
          is_online = TRUE,
-         device_name = COALESCE(EXCLUDED.device_name, user_devices.device_name),
-         device_type = COALESCE(EXCLUDED.device_type, user_devices.device_type)
-       RETURNING last_ack_device_seq`,
-      [message.device_id, message.user_id, message.device_name || null, message.device_type || null]
+         device_name = COALESCE($3, user_devices.device_name),
+         device_type = COALESCE($4, user_devices.device_type),
+         user_id = user_devices.user_id
+       RETURNING last_ack_device_seq, user_id`,
+      [message.device_id, message.user_id, deviceName, message.device_type || null]
     );
 
     const lastAckDeviceSeq = deviceResult.rows[0]?.last_ack_device_seq || 0;
+    // After ON CONFLICT, get the actual user_id (may be different from message.user_id if device was paired)
+    const actualUserId = deviceResult.rows[0]?.user_id || message.user_id;
 
     // Create session state
     const sessionState: SessionState = {
-      userId: message.user_id,
+      userId: actualUserId,
       deviceId: message.device_id,
       sessionKeys: {
         clientKey: state.sessionKeys!.clientKey,

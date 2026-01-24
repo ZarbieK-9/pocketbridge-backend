@@ -9,11 +9,17 @@ import { Router, Request, Response } from 'express';
 import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
 import type { Database } from '../db/postgres.js';
+import type { RedisConnection } from '../db/redis.js';
 
 let dbInstance: Database | null = null;
+let redisInstance: RedisConnection | null = null;
 
 export function setDatabase(db: Database): void {
   dbInstance = db;
+}
+
+export function setRedis(redis: RedisConnection): void {
+  redisInstance = redis;
 }
 
 const router = Router();
@@ -142,6 +148,44 @@ router.get('/lookup/:code', async (req: Request, res: Response) => {
     }
 
     const row = result.rows[0];
+
+    // Store pairing session in Redis for completePairing() to use
+    // This bridges the data from DB lookup to the WebSocket handler
+    if (redisInstance) {
+      const REDIS_PAIRING_PREFIX = 'pairing:';
+      const pairingSession = {
+        initiatingUserId: row.user_id,
+        initiatingDeviceId: row.device_id,
+        code: code,
+        createdAt: Date.now(),
+        expiresAt: new Date(row.expires_at).getTime(),
+        used: false,
+        deviceName: row.device_name,
+        publicKeyHex: row.public_key_hex,
+        privateKeyHex: row.private_key_hex,
+        wsUrl: row.ws_url,
+      };
+
+      // Calculate remaining TTL in seconds (max 10 minutes)
+      const ttlSeconds = Math.ceil((new Date(row.expires_at).getTime() - Date.now()) / 1000);
+      const finalTtl = Math.max(1, Math.min(ttlSeconds, 600)); // 1 to 600 seconds
+
+      try {
+        await redisInstance.client.setEx(
+          `${REDIS_PAIRING_PREFIX}${code}`,
+          finalTtl,
+          JSON.stringify(pairingSession)
+        );
+        logger.info('Pairing session stored in Redis', {
+          code,
+          ttl: finalTtl,
+          initiatingUserId: row.user_id.substring(0, 16) + '...',
+        });
+      } catch (redisError) {
+        logger.warn('Failed to store pairing session in Redis', { code }, redisError);
+        // Continue anyway - completePairing will fail if Redis is needed but we'll log the error
+      }
+    }
 
     // Delete the code after retrieval (one-time use)
     await dbInstance.pool.query('DELETE FROM pairing_codes WHERE code = $1', [code]);

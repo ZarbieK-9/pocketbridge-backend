@@ -77,13 +77,27 @@ router.get('/devices', async (req: Request, res: Response) => {
       }
     }
 
+    // Get user's display name from user_profiles
+    let userDisplayName: string | null = null;
+    try {
+      const profileResult = await database.pool.query(
+        `SELECT display_name FROM user_profiles WHERE user_id = $1`,
+        [userId]
+      );
+      if (profileResult.rows.length > 0 && profileResult.rows[0].display_name) {
+        userDisplayName = profileResult.rows[0].display_name;
+      }
+    } catch (profileError) {
+      logger.warn('Failed to fetch user profile for display name', { userId, error: profileError });
+    }
+
     // Get all devices for user (from devices table)
     let result;
     try {
       result = await database.pool.query(
-        `SELECT 
+        `SELECT
           device_id, device_name, device_type, device_os,
-          last_seen, registered_at, ip_address
+          last_seen, registered_at, ip_address, is_online
          FROM user_devices
          WHERE user_id = $1
          ORDER BY is_online DESC, last_seen DESC`,
@@ -206,10 +220,14 @@ router.get('/devices', async (req: Request, res: Response) => {
       count: number;
       is_empty: boolean;
       message?: string;
+      user_display_name?: string;
+      user_id: string;
     } = {
       devices: devices.filter(d => d !== null && d !== undefined), // Remove any null/undefined devices
       count: devices.length,
       is_empty,
+      user_id: userId,
+      ...(userDisplayName && { user_display_name: userDisplayName }),
     };
     
     if (is_empty) {

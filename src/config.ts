@@ -288,7 +288,7 @@ export const config: Config = {
     origin: process.env.CORS_ORIGIN
       ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
       : process.env.NODE_ENV === 'production'
-        ? [] // Must be set in production
+        ? ['https://pocketbridge-dun.vercel.app', 'https://pocketbridge.vercel.app'] // Production frontends
         : '*', // Allow all in development
     credentials: process.env.CORS_CREDENTIALS === 'true',
   },

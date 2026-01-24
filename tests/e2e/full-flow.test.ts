@@ -245,67 +245,198 @@ describe('E2E Full Flow Tests', () => {
     testServer = createServer(testApp);
     testWss = new WebSocketServer({ server: testServer, path: '/ws' });
 
-    // Initialize test database (use test DB if available, otherwise mock)
+    // Initialize test database (use REAL DB when available for production-like testing)
+    let useRealDb = false;
     try {
-      // Try to use test database if TEST_DATABASE_URL is set
-      if (process.env.TEST_DATABASE_URL) {
+      // Try to use real database (DATABASE_URL or TEST_DATABASE_URL)
+      if (process.env.DATABASE_URL || process.env.TEST_DATABASE_URL) {
         testDb = await initDatabase();
-      } else {
-        // Mock database
-        testDb = {
-          pool: {
-            query: vi.fn().mockResolvedValue({ rows: [] }),
-          } as any,
-          end: vi.fn(),
-          healthCheck: vi.fn().mockResolvedValue(true),
-        } as Database;
+        useRealDb = true;
+        console.log('[E2E] Using real database for production-like testing');
+        
+        // Clean up test data before each test
+        await testDb.pool.query(`
+          DELETE FROM events WHERE user_id LIKE '00000000%' OR user_id LIKE '%test%';
+          DELETE FROM stream_sequences WHERE user_id LIKE '00000000%' OR user_id LIKE '%test%';
+          DELETE FROM revoked_devices WHERE device_id LIKE '550e8400-%' OR device_id LIKE '%test%';
+          DELETE FROM user_devices WHERE device_id LIKE '550e8400-%' OR device_id LIKE '%test%';
+          DELETE FROM users WHERE user_id LIKE '00000000%' OR user_id LIKE '%test%';
+        `);
       }
     } catch (error) {
-      // Fallback to mock
+      console.warn('[E2E] Failed to connect to real database, using stateful mocks');
+      useRealDb = false;
+    }
+
+    // If real DB not available, create stateful mocks that simulate production behavior
+    if (!useRealDb) {
+      // In-memory state to simulate database persistence
+      const mockUsers = new Map<string, any>();
+      const mockDevices = new Map<string, any>();
+      const mockStreamSeqs = new Map<string, number>();
+      const mockEvents = new Map<string, any>();
+      
+      const queryImplementation = async (query: string, params?: any[]) => {
+            // INSERT INTO users
+            if (query.includes('INSERT INTO users')) {
+              const userId = params?.[0];
+              if (userId) {
+                mockUsers.set(userId, { user_id: userId, created_at: new Date() });
+              }
+              return { rows: [] };
+            }
+            
+            // UPDATE users last_activity
+            if (query.includes('UPDATE users') && query.includes('last_activity')) {
+              const userId = params?.[0];
+              if (userId && mockUsers.has(userId)) {
+                const user = mockUsers.get(userId);
+                user.last_activity = new Date();
+              }
+              return { rows: [] };
+            }
+            
+            // INSERT INTO user_devices
+            if (query.includes('INSERT INTO user_devices')) {
+              const deviceId = params?.[0];
+              const userId = params?.[1];
+              if (deviceId && userId) {
+                mockDevices.set(deviceId, {
+                  device_id: deviceId,
+                  user_id: userId,
+                  device_type: params?.[2] || 'mobile',
+                  os: params?.[3] || 'unknown',
+                  last_ack_device_seq: 0,
+                  is_online: false,
+                });
+              }
+              return { rows: [{ last_ack_device_seq: 0 }] };
+            }
+            
+            // SELECT device by device_id (CRITICAL for event relay)
+            if (query.includes('SELECT') && query.includes('user_devices') && query.includes('device_id = $1')) {
+              const deviceId = params?.[0];
+              if (deviceId && mockDevices.has(deviceId) && !revokedDevices.has(deviceId)) {
+                return { rows: [mockDevices.get(deviceId)] };
+              }
+              return { rows: [] };
+            }
+            
+            // SELECT devices by user_id (for finding relay targets)
+            if (query.includes('SELECT') && query.includes('user_devices') && query.includes('user_id = $1')) {
+              const userId = params?.[0];
+              const userDevices = Array.from(mockDevices.values())
+                .filter((d: any) => d.user_id === userId && !revokedDevices.has(d.device_id));
+              return { rows: userDevices };
+            }
+            
+            // UPDATE user_devices is_online
+            if (query.includes('UPDATE user_devices') && query.includes('is_online')) {
+              const deviceId = params?.find((p: any) => typeof p === 'string' && p.includes('-'));
+              if (deviceId && mockDevices.has(deviceId)) {
+                const device = mockDevices.get(deviceId);
+                device.is_online = params?.[0] === true || params?.[0] === 'true';
+                device.last_activity = new Date();
+              }
+              return { rows: [] };
+            }
+            
+            // INSERT INTO revoked_devices
+            if (query.includes('INSERT INTO revoked_devices')) {
+              const deviceId = params?.[0];
+              if (deviceId) {
+                revokedDevices.add(deviceId);
+              }
+              return { rows: [] };
+            }
+            
+            // SELECT revoked_devices
+            if (query.includes('SELECT') && query.includes('revoked_devices') && query.includes('device_id = $1')) {
+              const deviceId = params?.[0];
+              if (deviceId && revokedDevices.has(deviceId)) {
+                return { rows: [{ device_id: deviceId }] };
+              }
+              return { rows: [] };
+            }
+            
+            // Stream sequences
+            if (query.includes('SELECT') && query.includes('stream_sequences')) {
+              const userId = params?.[0];
+              const streamId = params?.[1];
+              const key = `${userId}:${streamId}`;
+              return { rows: [{ last_stream_seq: mockStreamSeqs.get(key) || 0 }] };
+            }
+            
+            if (query.includes('INSERT INTO stream_sequences')) {
+              const userId = params?.[0];
+              const streamId = params?.[1];
+              const key = `${userId}:${streamId}`;
+              const seq = mockStreamSeqs.get(key) || 0;
+              mockStreamSeqs.set(key, seq + 1);
+              return { rows: [{ last_stream_seq: seq + 1 }] };
+            }
+            
+            // INSERT INTO events
+            if (query.includes('INSERT INTO events')) {
+              const eventId = params?.[0];
+              if (eventId) {
+                mockEvents.set(eventId, { event_id: eventId });
+              }
+              return { rows: [] };
+            }
+            
+            // BEGIN/COMMIT/ROLLBACK (for transactions)
+            if (query === 'BEGIN' || query === 'COMMIT' || query === 'ROLLBACK') {
+              return { rows: [] };
+            }
+            
+            return { rows: [] };
+          };
+
+      // Create mock pool with query and connect methods
       testDb = {
         pool: {
-          query: vi.fn().mockResolvedValue({ rows: [] }),
+          query: vi.fn().mockImplementation(queryImplementation),
+          connect: vi.fn().mockImplementation(async () => {
+            // Return a mock client that uses the same query logic
+            return {
+              query: vi.fn().mockImplementation(queryImplementation),
+              release: vi.fn(),
+            };
+          }),
         } as any,
         end: vi.fn(),
         healthCheck: vi.fn().mockResolvedValue(true),
       } as Database;
     }
 
-    // Initialize test Redis (mock if not available)
+    // Initialize test Redis (use real Redis when available)
+    let useRealRedis = false;
     try {
-      if (process.env.TEST_REDIS_URL) {
+      if (process.env.REDIS_URL || process.env.TEST_REDIS_URL) {
         testRedis = await initRedis();
-      } else {
-        const mockSubscriber = {
-          subscribe: vi.fn().mockResolvedValue(undefined),
-          quit: vi.fn().mockResolvedValue(undefined),
-          on: vi.fn(),
-          connect: vi.fn().mockResolvedValue(undefined),
-        };
-        testRedis = {
-          client: {
-            publish: vi.fn().mockResolvedValue(1),
-            duplicate: vi.fn().mockReturnValue(mockSubscriber),
-            ping: vi.fn().mockResolvedValue('PONG'),
-            setEx: vi.fn().mockResolvedValue('OK'),
-            del: vi.fn().mockResolvedValue(1),
-          } as any,
-          quit: vi.fn(),
-          healthCheck: vi.fn().mockResolvedValue(true),
-        } as RedisConnection;
+        useRealRedis = true;
+        console.log('[E2E] Using real Redis for production-like testing');
       }
     } catch (error) {
-      // Fallback to mock
+      console.warn('[E2E] Failed to connect to real Redis, using mocks');
+      useRealRedis = false;
+    }
+
+    if (!useRealRedis) {
       const mockSubscriber = {
-        subscribe: vi.fn(),
-        quit: vi.fn(),
+        subscribe: vi.fn().mockResolvedValue(undefined),
+        quit: vi.fn().mockResolvedValue(undefined),
         on: vi.fn(),
+        connect: vi.fn().mockResolvedValue(undefined),
       };
       testRedis = {
         client: {
           publish: vi.fn().mockResolvedValue(1),
           duplicate: vi.fn().mockReturnValue(mockSubscriber),
           ping: vi.fn().mockResolvedValue('PONG'),
+          setEx: vi.fn().mockResolvedValue('OK'),
+          del: vi.fn().mockResolvedValue(1),
         } as any,
         quit: vi.fn(),
         healthCheck: vi.fn().mockResolvedValue(true),
@@ -314,49 +445,6 @@ describe('E2E Full Flow Tests', () => {
 
     // Clear revoked devices for each test
     revokedDevices.clear();
-    
-    // Setup database mocks for common queries
-    if (testDb && 'pool' in testDb && typeof (testDb.pool as any).query === 'function') {
-      const mockQuery = testDb.pool.query as ReturnType<typeof vi.fn>;
-      
-      // Mock user creation
-      mockQuery.mockImplementation(async (query: string, params?: any[]) => {
-        if (query.includes('INSERT INTO users')) {
-          return { rows: [] };
-        }
-        if (query.includes('INSERT INTO user_devices')) {
-          return { rows: [{ last_ack_device_seq: 0 }] };
-        }
-        if (query.includes('INSERT INTO revoked_devices')) {
-          // Track revoked device
-          if (params && params[0]) {
-            revokedDevices.add(params[0] as string);
-          }
-          return { rows: [] };
-        }
-        if (query.includes('SELECT') && query.includes('revoked_devices') && query.includes('device_id = $1')) {
-          // Check if device is revoked
-          const deviceId = params?.[0];
-          if (deviceId && revokedDevices.has(deviceId as string)) {
-            return { rows: [{ device_id: deviceId }] };
-          }
-          return { rows: [] };
-        }
-        if (query.includes('SELECT') && query.includes('stream_sequences')) {
-          return { rows: [{ last_stream_seq: 1 }] };
-        }
-        if (query.includes('INSERT INTO stream_sequences')) {
-          return { rows: [{ last_stream_seq: 1 }] };
-        }
-        if (query.includes('INSERT INTO events')) {
-          return { rows: [] };
-        }
-        if (query.includes('UPDATE user_devices') && query.includes('is_online')) {
-          return { rows: [] };
-        }
-        return { rows: [] };
-      });
-    }
 
     // Create WebSocket gateway
     createWebSocketGateway(testWss, {
@@ -417,17 +505,42 @@ describe('E2E Full Flow Tests', () => {
       }
     });
 
-    // Cleanup database and Redis
+    // Cleanup test data from real database
+    if (testDb && testDb.pool && typeof testDb.pool.query === 'function') {
+      try {
+        // Only clean up if using real database (check if query is not a mock)
+        const queryFn = testDb.pool.query as any;
+        if (!queryFn.mock) {
+          await testDb.pool.query(`
+            DELETE FROM events WHERE user_id LIKE '00000000%' OR user_id LIKE '%test%';
+            DELETE FROM stream_sequences WHERE user_id LIKE '00000000%' OR user_id LIKE '%test%';
+            DELETE FROM revoked_devices WHERE device_id LIKE '550e8400-%' OR device_id LIKE '%test%';
+            DELETE FROM user_devices WHERE device_id LIKE '550e8400-%' OR device_id LIKE '%test%';
+            DELETE FROM users WHERE user_id LIKE '00000000%' OR user_id LIKE '%test%';
+          `);
+        }
+      } catch (error) {
+        // Ignore cleanup errors
+      }
+    }
+
+    // Close database and Redis connections (only if real connections)
     if (testDb && typeof testDb.end === 'function') {
       try {
-        await testDb.end();
+        const endFn = testDb.end as any;
+        if (!endFn.mock) {
+          await testDb.end();
+        }
       } catch (error) {
         // Ignore cleanup errors
       }
     }
     if (testRedis && typeof testRedis.quit === 'function') {
       try {
-        await testRedis.quit();
+        const quitFn = testRedis.quit as any;
+        if (!quitFn.mock) {
+          await testRedis.quit();
+        }
       } catch (error) {
         // Ignore cleanup errors
       }
@@ -831,16 +944,31 @@ describe('E2E Full Flow Tests', () => {
 
       const connections: WebSocket[] = [];
 
-      // Connect all three devices
+      // Connect all three devices sequentially to avoid crypto race conditions
       for (const deviceId of deviceIds) {
         const ws = new WebSocket(`ws://localhost:${TEST_PORT}/ws`);
-        await new Promise<void>((resolve) => {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error(`Device ${deviceId} connection timeout`)), 10000);
+          
           ws.on('open', async () => {
-            await performHandshake(ws, userId, deviceId, clientIdentity);
-            resolve();
+            try {
+              await performHandshake(ws, userId, deviceId, clientIdentity);
+              clearTimeout(timeout);
+              resolve();
+            } catch (error) {
+              clearTimeout(timeout);
+              reject(error);
+            }
+          });
+          
+          ws.on('error', (error) => {
+            clearTimeout(timeout);
+            reject(error);
           });
         });
         connections.push(ws);
+        // Small delay between connections to avoid race conditions
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
 
       // Wait for all to be connected

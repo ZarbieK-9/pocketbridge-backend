@@ -58,6 +58,18 @@ export class DeviceRelay {
       return { relayed: 0, failed: 0, targetDevices: [] };
     }
 
+    // FILE EVENT TRACING: Extra logging for file events
+    if (event.type.startsWith('file:')) {
+      logger.info('FILE EVENT RELAYING TO DEVICES', {
+        eventType: event.type,
+        eventId: event.event_id,
+        senderDeviceId,
+        targetDevices,
+        targetCount: targetDevices.length,
+        userId: senderUserId.substring(0, 16) + '...',
+      });
+    }
+
     logger.info('Relaying event to user devices', {
       userId: senderUserId.substring(0, 16) + '...',
       senderDeviceId,
@@ -76,6 +88,17 @@ export class DeviceRelay {
       message,
       senderDeviceId // Exclude sender
     );
+
+    // FILE EVENT TRACING: Log relay result for file events
+    if (event.type.startsWith('file:')) {
+      logger.info('FILE EVENT RELAY COMPLETE', {
+        eventType: event.type,
+        eventId: event.event_id,
+        relayedCount: result.sent,
+        failedCount: result.failed,
+        targetDevices,
+      });
+    }
 
     return {
       relayed: result.sent,

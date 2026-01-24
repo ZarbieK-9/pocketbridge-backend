@@ -33,17 +33,18 @@ interface PairingSession {
 }
 
 const PAIRING_CODE_LENGTH = 6;
-const PAIRING_CODE_EXPIRY = 5 * 60 * 1000; // 5 minutes
+const PAIRING_CODE_EXPIRY = 10 * 60 * 1000; // 10 minutes (aligned with DB TTL)
 const REDIS_PAIRING_PREFIX = 'pairing:';
 const REDIS_PAIRING_INDEX_PREFIX = 'pairing_index:';
 
 /**
- * Generate a 6-digit pairing code
+ * Generate a cryptographically secure 6-digit pairing code
+ * Uses crypto.randomBytes() instead of Math.random() for security
  */
 function generateCode(): string {
-  return Math.floor(Math.random() * 1000000)
-    .toString()
-    .padStart(PAIRING_CODE_LENGTH, '0');
+  const buffer = crypto.randomBytes(4);
+  const number = buffer.readUInt32BE(0) % 1000000;
+  return number.toString().padStart(PAIRING_CODE_LENGTH, '0');
 }
 
 /**
@@ -116,122 +117,215 @@ export async function completePairing(
   }
 
   const key = `${REDIS_PAIRING_PREFIX}${pairingCode}`;
+  const lockKey = `${REDIS_PAIRING_PREFIX}${pairingCode}:lock`;
 
   try {
-    // Retrieve pairing session
-    const pairingData = await redis.client.get(key);
-    if (!pairingData) {
-      auditLog(AuditEventType.SECURITY_VIOLATION, {
-        userId: joiningUserId,
-        deviceId: joiningDeviceId,
-        details: { event: 'pairing_failed', reason: 'code_not_found', code: pairingCode },
-      });
-      throw new ValidationError('Pairing code not found or expired');
-    }
-
-    const pairingSession: PairingSession = JSON.parse(pairingData);
-
-    // Check if code already used
-    if (pairingSession.used) {
+    // ATOMIC LOCK: Use SETNX to prevent race conditions
+    // Only one device can acquire the lock and complete pairing
+    const lockAcquired = await redis.client.setNX(lockKey, joiningDeviceId);
+    if (!lockAcquired) {
+      // Another device is already completing this pairing
       throw new ValidationError('Pairing code already used');
     }
 
-    // Check if code expired
-    if (pairingSession.expiresAt < Date.now()) {
-      throw new ValidationError('Pairing code expired');
+    // Set lock expiry to prevent deadlocks (30 seconds should be plenty)
+    await redis.client.expire(lockKey, 30);
+
+    try {
+      // Retrieve pairing session
+      const pairingData = await redis.client.get(key);
+      if (!pairingData) {
+        auditLog(AuditEventType.SECURITY_VIOLATION, {
+          userId: joiningUserId,
+          deviceId: joiningDeviceId,
+          details: { event: 'pairing_failed', reason: 'code_not_found', code: pairingCode },
+        });
+        throw new ValidationError('Pairing code not found or expired');
+      }
+
+      const pairingSession: PairingSession = JSON.parse(pairingData);
+
+      // Check if code already used (double-check after lock)
+      if (pairingSession.used) {
+        throw new ValidationError('Pairing code already used');
+      }
+
+      // Check if code expired
+      if (pairingSession.expiresAt < Date.now()) {
+        throw new ValidationError('Pairing code expired');
+      }
+
+      // Check if same user trying to pair with self
+      if (pairingSession.initiatingUserId === joiningUserId) {
+        throw new ValidationError('Cannot pair device with same user');
+      }
+
+      const initiatingUserId = pairingSession.initiatingUserId;
+      const initiatingDeviceId = pairingSession.initiatingDeviceId;
+
+      // Mark pairing code as used BEFORE database operation
+      // This ensures even if DB fails, the code can't be reused
+      pairingSession.used = true;
+      pairingSession.completedAt = Date.now();
+      pairingSession.pairedUserId = joiningUserId;
+      pairingSession.pairedDeviceId = joiningDeviceId;
+
+      await redis.client.setEx(key, Math.ceil(PAIRING_CODE_EXPIRY / 1000), JSON.stringify(pairingSession));
+
+      // PAIRING LOGIC: Link Device B to Device A's user
+      // After this, Device B events will relay to Device A (and vice versa)
+      // IMPORTANT: All operations are wrapped in a transaction with row-level locking
+      // to prevent race conditions with concurrent pairing operations
+
+      const client = await db.pool.connect();
+      let updateResult;
+      let deviceName: string | null = null;
+
+      try {
+        await client.query('BEGIN');
+
+        // Step 1: Ensure initiating user exists
+        await client.query('INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING', [
+          initiatingUserId,
+        ]);
+
+        // Step 2: Get and lock existing device names for the target user
+        // FOR UPDATE prevents concurrent pairing from reading stale names
+        const existingNames = await client.query(
+          `SELECT device_name FROM user_devices WHERE user_id = $1 AND device_name IS NOT NULL FOR UPDATE`,
+          [initiatingUserId]
+        );
+        const existingNameSet = new Set(existingNames.rows.map((r: { device_name: string }) => r.device_name));
+
+        // Step 3: Get the current device name for the joining device
+        const joiningDeviceResult = await client.query(
+          `SELECT device_name FROM user_devices WHERE device_id = $1::uuid FOR UPDATE`,
+          [joiningDeviceId]
+        );
+        deviceName = joiningDeviceResult.rows[0]?.device_name || null;
+
+        // Step 4: If the device has a name, check for conflicts and auto-rename if needed
+        if (deviceName && existingNameSet.has(deviceName)) {
+          // Find a unique name by appending a number suffix
+          const baseName = deviceName.replace(/\s*\(\d+\)$/, ''); // Remove existing suffix like " (2)"
+          let suffix = 2;
+          let newName = `${baseName} (${suffix})`;
+          while (existingNameSet.has(newName)) {
+            suffix++;
+            newName = `${baseName} (${suffix})`;
+          }
+          const originalName = deviceName;
+          deviceName = newName;
+          logger.info('Auto-renamed device due to name conflict', {
+            originalName,
+            newName: deviceName,
+            joiningDeviceId,
+          });
+        }
+
+        // Step 5: Insert/update device with proper transaction isolation
+        // CRITICAL: Reset last_ack_device_seq to 0 on pairing to prevent "Device sequence not monotonic" errors
+        // After pairing, the client resets its device_seq counter, so the server must also reset
+        updateResult = await client.query(
+          `INSERT INTO user_devices (device_id, user_id, device_name, last_ack_device_seq, is_online, last_seen)
+           VALUES ($2::uuid, $1, $3, 0, TRUE, NOW())
+           ON CONFLICT (device_id)
+           DO UPDATE SET user_id = $1, device_name = $3, last_ack_device_seq = 0
+           RETURNING user_id`,
+          [initiatingUserId, joiningDeviceId, deviceName]
+        );
+
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+
+      // Verify update succeeded
+      if (updateResult.rows.length === 0 || updateResult.rows[0].user_id !== initiatingUserId) {
+        const actualUserId = updateResult.rows.length > 0 ? updateResult.rows[0].user_id : 'none';
+        logger.error('Device link verification failed', {
+          joiningDeviceId,
+          expectedUserId: initiatingUserId,
+          actualUserId,
+        });
+        throw new ValidationError(`Failed to link devices: device ${joiningDeviceId} not updated to user ${initiatingUserId.substring(0, 12)}...`);
+      }
+
+      logger.info('Pairing completed successfully', {
+        initiatingUserId: initiatingUserId.substring(0, 16) + '...',
+        initiatingDeviceId,
+        joiningUserId: joiningUserId.substring(0, 16) + '...',
+        joiningDeviceId,
+      });
+
+      auditLog(AuditEventType.SECURITY_VIOLATION, {
+        userId: initiatingUserId,
+        deviceId: initiatingDeviceId,
+        details: {
+          event: 'pairing_completed',
+          pairedWith: joiningDeviceId,
+          pairedUserOriginalId: joiningUserId,
+        },
+      });
+
+      auditLog(AuditEventType.SECURITY_VIOLATION, {
+        userId: initiatingUserId, // Now linked to initiator's user
+        deviceId: joiningDeviceId,
+        details: {
+          event: 'device_linked_via_pairing',
+          linkedFrom: joiningUserId,
+          linkedTo: initiatingUserId,
+        },
+      });
+
+      return {
+        success: true,
+        linkedUserId: initiatingUserId,
+        message: `Device paired successfully. Events will now sync between devices of user ${initiatingUserId.substring(0, 8)}...`,
+      };
+    } finally {
+      // Always release the lock, even if pairing fails
+      await redis.client.del(lockKey).catch((err) => {
+        logger.warn('Failed to release pairing lock', { lockKey, error: err });
+      });
     }
-
-    // Check if same user trying to pair with self
-    if (pairingSession.initiatingUserId === joiningUserId) {
-      throw new ValidationError('Cannot pair device with same user');
-    }
-
-    const initiatingUserId = pairingSession.initiatingUserId;
-    const initiatingDeviceId = pairingSession.initiatingDeviceId;
-
-    // PAIRING LOGIC: Link Device B to Device A's user
-    // After this, Device B events will relay to Device A (and vice versa)
-
-    // Step 1: Update Device B's user_id in database
-    // This makes Device B part of User A's device group
-    await db.pool.query(
-      `UPDATE user_devices 
-       SET user_id = $1
-       WHERE device_id = $2 AND user_id = $3`,
-      [initiatingUserId, joiningDeviceId, joiningUserId]
-    );
-
-    // Verify update succeeded
-    const updateCheck = await db.pool.query(
-      `SELECT user_id FROM user_devices WHERE device_id = $1`,
-      [joiningDeviceId]
-    );
-
-    if (updateCheck.rows.length === 0 || updateCheck.rows[0].user_id !== initiatingUserId) {
-      throw new ValidationError('Failed to link devices');
-    }
-
-    // Step 2: Mark pairing code as used
-    pairingSession.used = true;
-    pairingSession.completedAt = Date.now();
-    pairingSession.pairedUserId = joiningUserId;
-    pairingSession.pairedDeviceId = joiningDeviceId;
-
-    await redis.client.setEx(key, Math.ceil(PAIRING_CODE_EXPIRY / 1000), JSON.stringify(pairingSession));
-
-    logger.info('Pairing completed successfully', {
-      initiatingUserId: initiatingUserId.substring(0, 16) + '...',
-      initiatingDeviceId,
-      joiningUserId: joiningUserId.substring(0, 16) + '...',
-      joiningDeviceId,
-    });
-
-    auditLog(AuditEventType.SECURITY_VIOLATION, {
-      userId: initiatingUserId,
-      deviceId: initiatingDeviceId,
-      details: {
-        event: 'pairing_completed',
-        pairedWith: joiningDeviceId,
-        pairedUserOriginalId: joiningUserId,
-      },
-    });
-
-    auditLog(AuditEventType.SECURITY_VIOLATION, {
-      userId: initiatingUserId, // Now linked to initiator's user
-      deviceId: joiningDeviceId,
-      details: {
-        event: 'device_linked_via_pairing',
-        linkedFrom: joiningUserId,
-        linkedTo: initiatingUserId,
-      },
-    });
-
-    return {
-      success: true,
-      linkedUserId: initiatingUserId,
-      message: `Device paired successfully. Events will now sync between devices of user ${initiatingUserId.substring(0, 8)}...`,
-    };
   } catch (error) {
-    logger.error('Failed to complete pairing', {
-      error,
+    const pgErrorCode = (error as any)?.code;
+    const errorMessage = error instanceof Error ? (error.message || 'Failed to complete pairing') : String(error);
+
+    logger.error(`Failed to complete pairing: ${errorMessage}`, {
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+      errorMessage,
+      pgErrorCode,
       code: pairingCode,
       joiningUserId,
       joiningDeviceId,
-    });
+    }, error);
 
     auditLog(AuditEventType.SECURITY_VIOLATION, {
       userId: joiningUserId,
       deviceId: joiningDeviceId,
       details: {
         event: 'pairing_failed',
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
       },
     });
+    if (pgErrorCode === '23505') {
+      throw new ValidationError('Device name already exists on the target account. Please rename this device and try pairing again.');
+    }
 
     if (error instanceof ValidationError) {
       throw error;
     }
-    throw new ValidationError('Failed to complete pairing');
+
+    const message = error instanceof Error
+      ? (error.message || 'Failed to complete pairing')
+      : 'Failed to complete pairing';
+
+    throw new ValidationError(message);
   }
 }
 

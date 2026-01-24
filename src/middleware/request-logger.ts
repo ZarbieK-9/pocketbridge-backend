@@ -11,10 +11,11 @@ import { logger } from '../utils/logger.js';
 export const requestLogger = pinoHttp({
   logger,
   customLogLevel: (req: Request, res: Response, error?: Error) => {
+    // Only log errors and warnings, silence all successful requests
     if (error) return 'error';
     if (res.statusCode >= 500) return 'error';
     if (res.statusCode >= 400) return 'warn';
-    return 'info';
+    return 'silent'; // Silence all successful API requests
   },
   customSuccessMessage: (req: Request, res: Response) => {
     return `${req.method} ${req.url} completed`;
