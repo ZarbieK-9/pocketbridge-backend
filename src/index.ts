@@ -256,6 +256,7 @@ const wss = new WebSocketServer({
   path: '/ws',
   perMessageDeflate: false, // Disable compression (security: CRIME attack)
   clientTracking: true,
+  maxPayload: 15 * 1024 * 1024, // 15MB - accommodate 5MB chunks with encryption + base64 overhead
 });
 
 // Initialize services

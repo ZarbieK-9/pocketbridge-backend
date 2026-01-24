@@ -316,8 +316,10 @@ export function createWebSocketGateway(
         }
 
         // Validate message size (prevent DoS)
-        if (data.length > 10 * 1024 * 1024) {
-          // 10MB
+        // 5MB chunks + encryption + double base64 encoding can exceed 10MB
+        // Allow up to 15MB to accommodate encrypted 5MB chunks with overhead
+        if (data.length > 15 * 1024 * 1024) {
+          // 15MB
           throw new Error('Message too large');
         }
 

@@ -10,7 +10,7 @@
 import { ValidationError } from './errors.js';
 
 // Constants
-export const MAX_PAYLOAD_SIZE = 10 * 1024 * 1024; // 10MB per event (chunks are 5MB + overhead)
+export const MAX_PAYLOAD_SIZE = 15 * 1024 * 1024; // 15MB per event (5MB chunks + encryption + double base64 overhead)
 export const MAX_STREAM_ID_LENGTH = 256;
 export const MAX_EVENT_TYPE_LENGTH = 64;
 export const MAX_DEVICE_ID_LENGTH = 36; // UUIDv4
