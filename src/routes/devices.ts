@@ -496,6 +496,17 @@ router.delete('/devices/:deviceId', async (req: Request, res: Response) => {
       return res.status(403).json({ error: "Cannot remove another user's device" });
     }
 
+    // Notify the device it's being revoked (if online) BEFORE deleting
+    // This allows the device to restore its original identity
+    if (sessionsMap && typeof (sessionsMap as any)._notifyDeviceRevoked === 'function') {
+      const notified = (sessionsMap as any)._notifyDeviceRevoked(userId, deviceId, 'Device has been removed by user');
+      if (notified) {
+        logger.info('Device notified of revocation', { deviceId, userId: userId.substring(0, 16) + '...' });
+        // Give the device a moment to receive the message before deleting
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
     // Hard delete device; events referencing it will cascade if configured
     await database.pool.query(
       `DELETE FROM user_devices WHERE device_id = $1::uuid AND user_id = $2`,

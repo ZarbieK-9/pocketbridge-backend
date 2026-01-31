@@ -400,6 +400,38 @@ export async function handleEvent(
     });
   }
 
+  // ACTIVITY EVENTS: Emit system message for activity tracking (e.g., file synced)
+  // This allows the dashboard to show real-time activity without polling
+  if (routedEvent.type === 'file:metadata' && deviceRelay) {
+    try {
+      await deviceRelay.broadcastSystemMessage(
+        sessionState.userId,
+        {
+          type: 'activity:event',
+          payload: {
+            event_id: routedEvent.event_id,
+            device_id: routedEvent.device_id,
+            type: 'file:metadata',
+            created_at: Date.now(),
+            payload_size: payloadSize,
+          },
+        },
+        sessionState.deviceId // Exclude sender device
+      );
+      logger.debug('Activity event broadcast for file:metadata', {
+        eventId: routedEvent.event_id,
+        userId: sessionState.userId.substring(0, 16) + '...',
+      });
+    } catch (error) {
+      // Log but don't fail - activity tracking shouldn't block event processing
+      logger.warn(
+        'Failed to broadcast activity:event system message',
+        { eventId: routedEvent.event_id },
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+
   // Also publish to Redis for horizontal scaling and persistence
   const redisStart = Date.now();
   try {

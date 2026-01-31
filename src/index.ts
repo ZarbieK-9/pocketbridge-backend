@@ -64,6 +64,7 @@ import userRouter, {
   setDatabase as setUserDatabase,
   setSessionsMap as setUserSessionsMap,
 } from './routes/user.js';
+import eventsRouter, { setDatabase as setEventsDatabase } from './routes/events.js';
 
 const app = express();
 
@@ -227,6 +228,7 @@ app.use('/api/v1', statusRouter);
 app.use('/api/v1', devicesRouter);
 app.use('/api/v1', userRouter);
 app.use('/api/v1', userProfileRouter);
+app.use('/api/v1', eventsRouter);
 
 // Backward compatibility: also support /api/... (defaults to v1)
 app.use('/api/auth', authRouter);
@@ -235,6 +237,7 @@ app.use('/api', statusRouter);
 app.use('/api', devicesRouter);
 app.use('/api', userRouter);
 app.use('/api', userProfileRouter);
+app.use('/api', eventsRouter);
 
 // 404 handler
 app.use((req, res) => {
@@ -325,6 +328,9 @@ async function start() {
     // Set database for user profile routes
     const { setDatabase: setUserProfileDatabase } = await import('./routes/user-profile.js');
     setUserProfileDatabase(db);
+
+    // Set database for events routes
+    setEventsDatabase(db);
 
     // Initialize Redis
     redis = await initRedis();

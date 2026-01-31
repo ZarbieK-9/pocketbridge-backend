@@ -1304,18 +1304,62 @@ export function createWebSocketGateway(
   (sessionsMap as any)._cleanup = () => {
     clearInterval(sessionTimeoutInterval);
     logger.debug('Session timeout interval cleared');
-    
+
     // Also clear all active handshake timeouts
     handshakeTimeouts.forEach((timeout: NodeJS.Timeout) => {
       clearTimeout(timeout);
     });
-    
+
     // Clear all active heartbeat intervals
     heartbeatIntervals.forEach((interval: NodeJS.Timeout) => {
       clearInterval(interval);
     });
   };
-  
+
+  // Attach function to notify a device it has been revoked
+  // This sends a message to the device before closing the connection,
+  // allowing the device to restore its original identity
+  (sessionsMap as any)._notifyDeviceRevoked = (userId: string, deviceId: string, reason?: string): boolean => {
+    const ws = sessionManager.getWebSocket(userId, deviceId);
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      logger.debug('Device not online, cannot send revocation notice', { deviceId, userId: userId.substring(0, 16) + '...' });
+      return false;
+    }
+
+    try {
+      // Send device_revoked message to the device
+      ws.send(JSON.stringify({
+        type: 'device_revoked',
+        payload: {
+          type: 'device_revoked',
+          reason: reason || 'Device has been removed',
+          timestamp: Date.now(),
+        },
+      }));
+
+      logger.info('Sent device_revoked notification', {
+        deviceId,
+        userId: userId.substring(0, 16) + '...',
+        reason: reason || 'Device has been removed',
+      });
+
+      // Close the connection after a short delay to allow message delivery
+      setTimeout(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, 'Device revoked');
+        }
+      }, 500);
+
+      return true;
+    } catch (error) {
+      logger.error('Failed to send device_revoked notification', {
+        deviceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  };
+
   return sessionsMap;
 }
 
