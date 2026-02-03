@@ -483,12 +483,32 @@ export function createWebSocketGateway(
                 );
               }
 
+              // Check if this device ID is already connected for this user
+              const existingSession = sessionManager.getSession(
+                newSessionState.userId,
+                newSessionState.deviceId
+              );
+              if (existingSession) {
+                logger.warn('⚠️  DUPLICATE DEVICE_ID - Replacing existing session', {
+                  userId: newSessionState.userId.substring(0, 16) + '...',
+                  deviceId: newSessionState.deviceId,
+                  existingSessionAge: Date.now() - existingSession.createdAt,
+                });
+              }
+
               sessionManager.addSession(
                 newSessionState.userId,
                 newSessionState.deviceId,
                 newSessionState,
                 ws
               );
+
+              logger.info('✅ Session added to manager', {
+                userId: newSessionState.userId.substring(0, 16) + '...',
+                deviceId: newSessionState.deviceId,
+                totalDevicesForUser: sessionManager.getOnlineDevices(newSessionState.userId).length,
+                allDeviceIds: sessionManager.getOnlineDevices(newSessionState.userId),
+              });
 
               // Track device for per-user rate limiting
               trackUserDevice(newSessionState.userId, newSessionState.deviceId);
@@ -1388,6 +1408,12 @@ async function subscribeToDeviceChannel(
     try {
       if (ws.readyState === WebSocket.OPEN) {
         const event = JSON.parse(message);
+        // Skip events sent by this device — the direct relay in event-handler.ts
+        // already delivered to other devices. Without this check, the sender
+        // receives its own events back via Redis pub/sub.
+        if (event.device_id === deviceId) {
+          return;
+        }
         ws.send(JSON.stringify({ type: 'event', payload: event }));
       }
     } catch (error) {

@@ -6,10 +6,77 @@
  */
 
 import { Router, Request, Response } from 'express';
+import os from 'os';
 import { logger } from '../utils/logger.js';
 import { ValidationError } from '../utils/errors.js';
 import type { Database } from '../db/postgres.js';
 import type { RedisConnection } from '../db/redis.js';
+
+/**
+ * Get the machine's LAN IPv4 address, skipping virtual/container adapters.
+ * Used to replace "localhost" in pairing URLs so external devices can connect.
+ */
+function getLocalLanIp(): string | null {
+  const interfaces = os.networkInterfaces();
+  const candidates: { name: string; address: string }[] = [];
+
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] || []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        candidates.push({ name, address: iface.address });
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0].address;
+
+  // Skip virtual/container network adapters that external devices can't reach
+  const virtualNamePatterns = [
+    /virtualbox/i, /vbox/i, /vmware/i, /vmnet/i,
+    /docker/i, /wsl/i, /hyper-v/i, /vethernet/i,
+  ];
+  const virtualIpPrefixes = ['192.168.56.', '172.17.', '172.18.'];
+
+  const real = candidates.filter(({ name, address }) => {
+    if (virtualNamePatterns.some(p => p.test(name))) return false;
+    if (virtualIpPrefixes.some(p => address.startsWith(p))) return false;
+    return true;
+  });
+
+  const chosen = real.length > 0 ? real[0] : candidates[0];
+  logger.info('getLocalLanIp resolved', {
+    chosen: chosen.address,
+    interface: chosen.name,
+    allCandidates: candidates.map(c => `${c.name}=${c.address}`),
+  });
+  return chosen.address;
+}
+
+/**
+ * Replace localhost/127.0.0.1 in a WebSocket URL with the machine's LAN IP.
+ * This ensures external devices (phones) can reach the server.
+ */
+function normalizeWsUrlForSharing(wsUrl: string): string {
+  try {
+    const parsed = new URL(wsUrl);
+    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {
+      const lanIp = getLocalLanIp();
+      if (lanIp) {
+        parsed.hostname = lanIp;
+        logger.info('Normalized localhost wsUrl for pairing', {
+          original: wsUrl,
+          normalized: parsed.toString(),
+          lanIp,
+        });
+        return parsed.toString().replace(/\/$/, ''); // Remove trailing slash
+      }
+    }
+  } catch {
+    // If URL parsing fails, return as-is
+  }
+  return wsUrl;
+}
 
 let dbInstance: Database | null = null;
 let redisInstance: RedisConnection | null = null;
@@ -53,6 +120,9 @@ router.post('/store', async (req: Request, res: Response) => {
       throw new Error('Database not initialized');
     }
 
+    // Normalize localhost URLs to LAN IP so external devices (phones) can connect
+    const shareableWsUrl = normalizeWsUrlForSharing(data.wsUrl);
+
     // Store pairing code with 10-minute expiration
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
@@ -67,7 +137,7 @@ router.post('/store', async (req: Request, res: Response) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         code,
-        data.wsUrl,
+        shareableWsUrl,
         data.userId,
         data.deviceId,
         data.deviceName || 'Device',
@@ -76,6 +146,33 @@ router.post('/store', async (req: Request, res: Response) => {
         expiresAt,
       ]
     );
+
+    // Also store in Redis so that the WebSocket complete_pairing handler can find it.
+    // The mobile app may use the QR identity directly (skipping /lookup), so Redis
+    // must be populated at creation time, not just on lookup.
+    if (redisInstance) {
+      const REDIS_PAIRING_PREFIX = 'pairing:';
+      const pairingSession = {
+        code,
+        initiatingUserId: data.userId,
+        initiatingDeviceId: data.deviceId,
+        createdAt: Date.now(),
+        expiresAt: expiresAt.getTime(),
+        used: false,
+      };
+
+      const ttlSeconds = 10 * 60; // 10 minutes
+      try {
+        await redisInstance.client.setEx(
+          `${REDIS_PAIRING_PREFIX}${code}`,
+          ttlSeconds,
+          JSON.stringify(pairingSession)
+        );
+        logger.info('Pairing session stored in Redis at creation', { code });
+      } catch (redisError) {
+        logger.warn('Failed to store pairing session in Redis', { code }, redisError);
+      }
+    }
 
     logger.info('Pairing code stored', {
       code,
@@ -88,6 +185,7 @@ router.post('/store', async (req: Request, res: Response) => {
       message: 'Pairing code stored',
       expiresAt: expiresAt.toISOString(),
       expiresIn: 10 * 60 * 1000, // 10 minutes in milliseconds
+      shareableWsUrl, // Normalized URL for external devices (localhost → LAN IP)
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
