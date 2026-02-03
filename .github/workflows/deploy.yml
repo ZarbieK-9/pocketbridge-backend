@@ -6,20 +6,14 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT }}
-          script: |
-            set -e
-            cd ${{ secrets.DEPLOY_PATH }}
-            git fetch origin main
-            git reset --hard origin/main
-            npm ci
-            npm run build
-            sudo systemctl restart pm2-zarbie.service
+      - name: Deploy locally on runner
+        run: |
+          set -e
+          cd /home/zarbie/Downloads/pocketbridge-backend
+          git fetch origin main
+          git reset --hard origin/main
+          npm ci
+          npm run build
+          sudo systemctl restart pm2-zarbie.service
