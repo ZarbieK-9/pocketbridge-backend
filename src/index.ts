@@ -48,6 +48,7 @@ import { generateServerIdentityKeypair } from './crypto/utils.js';
 import { securityHeaders } from './middleware/security-headers.js';
 import { startTTLCleanupJob } from './jobs/ttl-cleanup.js';
 import { getMetrics } from './routes/metrics.js';
+import { getBuildInfo } from './utils/build-info.js';
 import adminRouter, { setDatabase } from './routes/admin.js';
 import pairingRouter, { setDatabase as setPairingDatabase, setRedis as setPairingRedis } from './routes/pairing.js';
 import statusRouter, {
@@ -187,6 +188,8 @@ app.get('/health', async (req, res) => {
       res.setHeader('Retry-After', '30');
     }
 
+    const buildInfo = getBuildInfo();
+
     res.status(statusCode).json({
       status,
       timestamp: Date.now(),
@@ -195,7 +198,8 @@ app.get('/health', async (req, res) => {
         database: dbHealthy ? 'connected' : 'disconnected',
         redis: redisHealthy ? 'connected' : 'disconnected',
       },
-      version: process.env.npm_package_version || '1.0.0',
+      version: buildInfo.version,
+      build: buildInfo,
     });
   } catch (error) {
     logger.error(

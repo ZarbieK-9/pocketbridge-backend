@@ -7,6 +7,7 @@
 import { Request, Response } from 'express';
 import { metrics } from '../services/metrics.js';
 import { logger } from '../utils/logger.js';
+import { getBuildInfo } from '../utils/build-info.js';
 
 /**
  * Get metrics in Prometheus format
@@ -19,9 +20,13 @@ export function getMetrics(req: Request, res: Response): void {
     const lines: string[] = [];
 
     // Add Prometheus format headers
+    const buildInfo = getBuildInfo();
+
     lines.push('# HELP pocketbridge_info Server information');
     lines.push('# TYPE pocketbridge_info gauge');
-    lines.push('pocketbridge_info{version="1.0.0"} 1');
+    lines.push(
+      `pocketbridge_info{version="${buildInfo.version}",commit="${buildInfo.commit || ''}",branch="${buildInfo.branch || ''}",build_time="${buildInfo.buildTime || ''}"} 1`
+    );
     lines.push('');
 
     // Export all metrics
