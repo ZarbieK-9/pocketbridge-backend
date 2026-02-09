@@ -126,6 +126,15 @@ router.post('/store', async (req: Request, res: Response) => {
     // Store pairing code with 10-minute expiration
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
+    // Ensure user exists in users table (for foreign key constraint)
+    // This allows mobile-first pairing where the mobile device generates the identity
+    await dbInstance.pool.query(
+      `INSERT INTO users (user_id, created_at, last_active_at)
+       VALUES ($1, NOW(), NOW())
+       ON CONFLICT (user_id) DO NOTHING`,
+      [data.userId]
+    );
+
     // Delete any existing pairing codes for this user/device to prevent duplicates
     await dbInstance.pool.query(`DELETE FROM pairing_codes WHERE user_id = $1 AND device_id = $2`, [
       data.userId,
