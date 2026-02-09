@@ -129,8 +129,8 @@ router.post('/store', async (req: Request, res: Response) => {
     // Ensure user exists in users table (for foreign key constraint)
     // This allows mobile-first pairing where the mobile device generates the identity
     await dbInstance.pool.query(
-      `INSERT INTO users (user_id, created_at, last_active_at)
-       VALUES ($1, NOW(), NOW())
+      `INSERT INTO users (user_id, created_at, last_activity, is_active)
+       VALUES ($1, NOW(), NOW(), true)
        ON CONFLICT (user_id) DO NOTHING`,
       [data.userId]
     );
