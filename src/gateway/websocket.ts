@@ -767,6 +767,15 @@ export function createWebSocketGateway(
               sessionState.deviceId,
               true
             );
+          } else if (message.type === 'scratchpad_sync') {
+            // Direct relay for scratchpad Yjs updates
+            // No storage, no sequence tracking, no ACKs
+            // Yjs CRDT handles convergence and conflict resolution natively
+            await deviceRelay.broadcastSystemMessage(
+              sessionState.userId,
+              { type: 'scratchpad_sync', payload: message.payload },
+              sessionState.deviceId // exclude sender
+            );
           } else if (message.type === 'ping') {
             // Respond to heartbeat ping with pong
             safeSend(
