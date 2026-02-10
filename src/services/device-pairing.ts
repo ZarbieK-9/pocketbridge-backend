@@ -155,9 +155,11 @@ export async function completePairing(
         throw new ValidationError('Pairing code expired');
       }
 
-      // Check if same user trying to pair with self
-      if (pairingSession.initiatingUserId === joiningUserId) {
-        throw new ValidationError('Cannot pair device with same user');
+      // Check if same device trying to pair with itself
+      // Note: user IDs will match when Device B adopts Device A's identity before connecting — that's expected.
+      // We only block the same physical device (same device_id) from pairing with itself.
+      if (pairingSession.initiatingDeviceId === joiningDeviceId) {
+        throw new ValidationError('Cannot pair device with itself');
       }
 
       const initiatingUserId = pairingSession.initiatingUserId;
