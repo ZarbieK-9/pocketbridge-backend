@@ -608,7 +608,7 @@ async function handleClientAuth(
       [message.device_id, message.user_id, deviceName, message.device_type || null]
     );
 
-    const lastAckDeviceSeq = deviceResult.rows[0]?.last_ack_device_seq || 0;
+    const lastAckDeviceSeq = Number(deviceResult.rows[0]?.last_ack_device_seq) || 0;
     // After ON CONFLICT, get the actual user_id (may be different from message.user_id if device was paired)
     const actualUserId = deviceResult.rows[0]?.user_id || message.user_id;
 
