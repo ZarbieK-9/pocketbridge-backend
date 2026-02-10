@@ -208,12 +208,15 @@ export async function handleEvent(
 
   // GAP DETECTION: Check if device_seq indicates a gap in the sequence
   // If current device_seq > lastAckDeviceSeq + 1, we're missing events
+  // NON-BLOCKING: Log the gap and request missing events, but still process
+  // the current event immediately. Clients use Yjs CRDT which handles
+  // out-of-order events, so strict ordering is not required for correctness.
   if (encryptedEvent.device_seq > sessionState.lastAckDeviceSeq + 1) {
     const gap = encryptedEvent.device_seq - sessionState.lastAckDeviceSeq - 1;
     const startSeq = sessionState.lastAckDeviceSeq + 1;
     const endSeq = encryptedEvent.device_seq - 1;
 
-    logger.warn('Sequence gap detected', {
+    logger.warn('Sequence gap detected (non-blocking)', {
       deviceId: sessionState.deviceId,
       userId: sessionState.userId.substring(0, 16) + '...',
       lastAckDeviceSeq: sessionState.lastAckDeviceSeq,
@@ -223,32 +226,20 @@ export async function handleEvent(
       eventId: encryptedEvent.event_id,
     });
 
-    // Buffer this event (out-of-order) for processing after gap is filled
-    if (!sessionState.bufferedEvents) {
-      sessionState.bufferedEvents = new Map();
-    }
-    sessionState.bufferedEvents.set(encryptedEvent.device_seq, encryptedEvent);
-
-    // Request missing events from client
-    await sendMissingEventsRequest(
+    // Request missing events from client (best-effort, don't block)
+    sendMissingEventsRequest(
       sessionState,
       deviceRelay,
       startSeq,
       endSeq
-    );
+    ).catch(err => logger.warn('Failed to request missing events', { error: String(err) }));
 
     // Increment gap detection metric
     incrementCounter('sequence_gaps_detected_total', {
       deviceId: sessionState.deviceId,
     });
 
-    logger.info('Event buffered, waiting for gap fill', {
-      bufferedSeq: encryptedEvent.device_seq,
-      bufferSize: sessionState.bufferedEvents.size,
-    });
-
-    // Don't process this event yet - it will be processed after gap is filled
-    return;
+    // Continue processing — don't block event relay
   }
 
   // Assign stream_seq (get next sequence for this stream) with timeout and circuit breaker
