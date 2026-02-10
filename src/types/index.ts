@@ -80,6 +80,8 @@ export interface SessionState {
   createdAt: number;
   /** Set of already processed device sequences to handle out-of-order delivery */
   processedDeviceSeqs?: Set<number>;
+  /** Buffered out-of-order events waiting for gap to be filled */
+  bufferedEvents?: Map<number, EncryptedEvent>;
 }
 
 /**

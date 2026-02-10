@@ -35,9 +35,11 @@ import {
   trackUserDevice,
   untrackUserDevice,
   checkConcurrentDeviceLimit,
+  tryTrackUserDevice,
 } from '../middleware/rate-limit.js';
 import {
   checkConnectionLimit,
+  tryIncrementConnection,
   incrementConnection,
   decrementConnection,
 } from '../middleware/connection-limits.js';
@@ -59,6 +61,38 @@ interface GatewayDependencies {
   db: Database;
   redis: RedisConnection;
   serverIdentity?: ServerIdentityKeypair;
+}
+
+// Track in-flight replay requests to prevent concurrent duplicate replays
+const inFlightReplayRequests = new WeakMap<WebSocket, boolean>();
+
+/**
+ * Safely send message to WebSocket with state validation
+ * Returns true if sent successfully, false if connection not ready
+ */
+function safeSend(ws: WebSocket, message: string, context?: { userId?: string; deviceId?: string }): boolean {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (context) {
+      logger.debug('Skipping send to non-OPEN WebSocket', {
+        userId: context.userId?.substring(0, 16) + '...',
+        deviceId: context.deviceId,
+        readyState: ws?.readyState,
+      });
+    }
+    return false;
+  }
+
+  try {
+    ws.send(message);
+    return true;
+  } catch (error) {
+    logger.error(
+      'Failed to send WebSocket message',
+      context || {},
+      error instanceof Error ? error : new Error(String(error))
+    );
+    return false;
+  }
 }
 
 /**
@@ -130,30 +164,24 @@ export function createWebSocketGateway(
       if (remainingMs <= warningThresholdMs && remainingMs > 0) {
         const alreadyWarned = expirationWarningsent.get(ws);
         if (!alreadyWarned) {
-          try {
-            ws.send(
-              JSON.stringify({
+          const sent = safeSend(
+            ws,
+            JSON.stringify({
+              type: 'session_expiring_soon',
+              payload: {
                 type: 'session_expiring_soon',
-                payload: {
-                  type: 'session_expiring_soon',
-                  expires_in_seconds: Math.ceil(remainingMs / 1000),
-                  expires_at: now + remainingMs,
-                },
-              })
-            );
+                expires_in_seconds: Math.ceil(remainingMs / 1000),
+                expires_at: now + remainingMs,
+              },
+            }),
+            { userId: sessionState.userId, deviceId: sessionState.deviceId }
+          );
+          if (sent) {
             expirationWarningsent.set(ws, true);
             logger.info('Session expiration warning sent', {
               deviceId: sessionState.deviceId,
               expiresInSeconds: Math.ceil(remainingMs / 1000),
             });
-          } catch (error) {
-            logger.warn(
-              'Failed to send session expiration warning',
-              {
-                deviceId: sessionState.deviceId,
-              },
-              error instanceof Error ? error : new Error(String(error))
-            );
           }
         }
       }
@@ -428,12 +456,13 @@ export function createWebSocketGateway(
                 return;
               }
 
-              // Check connection limits
-              const connectionLimit = checkConnectionLimit(
+              // Atomically check connection limits and increment count
+              // This prevents race conditions where multiple connections bypass limits
+              const connectionResult = tryIncrementConnection(
                 newSessionState.userId,
                 newSessionState.deviceId
               );
-              if (!connectionLimit.allowed) {
+              if (!connectionResult.success) {
                 auditLog(AuditEventType.CONNECTION_LIMIT_EXCEEDED, {
                   userId: newSessionState.userId,
                   deviceId: newSessionState.deviceId,
@@ -442,13 +471,13 @@ export function createWebSocketGateway(
                   userId: newSessionState.userId.substring(0, 16) + '...',
                   deviceId: newSessionState.deviceId,
                 });
-                ws.close(1008, connectionLimit.error);
+                ws.close(1008, connectionResult.error);
                 return;
               }
 
-              // Check per-user concurrent device limit (max 5 devices)
-              const deviceLimit = checkConcurrentDeviceLimit(newSessionState.userId, 5);
-              if (!deviceLimit.allowed) {
+              // Atomically check per-user concurrent device limit and track device (max 5 devices)
+              const deviceTrackResult = tryTrackUserDevice(newSessionState.userId, newSessionState.deviceId, 5);
+              if (!deviceTrackResult.success) {
                 auditLog(AuditEventType.CONNECTION_LIMIT_EXCEEDED, {
                   userId: newSessionState.userId,
                   deviceId: newSessionState.deviceId,
@@ -458,7 +487,9 @@ export function createWebSocketGateway(
                   userId: newSessionState.userId.substring(0, 16) + '...',
                   deviceId: newSessionState.deviceId,
                 });
-                ws.close(1008, deviceLimit.error);
+                // Rollback connection count since we're rejecting
+                decrementConnection(newSessionState.userId, newSessionState.deviceId);
+                ws.close(1008, deviceTrackResult.error);
                 return;
               }
 
@@ -489,11 +520,23 @@ export function createWebSocketGateway(
                 newSessionState.deviceId
               );
               if (existingSession) {
-                logger.warn('⚠️  DUPLICATE DEVICE_ID - Replacing existing session', {
+                logger.warn('⚠️  DUPLICATE DEVICE_ID - Closing old connection', {
                   userId: newSessionState.userId.substring(0, 16) + '...',
                   deviceId: newSessionState.deviceId,
                   existingSessionAge: Date.now() - existingSession.createdAt,
                 });
+
+                // Get the old WebSocket and close it
+                const oldWs = sessionManager.getWebSocket(
+                  newSessionState.userId,
+                  newSessionState.deviceId
+                );
+                if (oldWs && oldWs.readyState === WebSocket.OPEN) {
+                  logger.info('Closing old WebSocket for duplicate device', {
+                    deviceId: newSessionState.deviceId,
+                  });
+                  oldWs.close(1000, 'New connection established for this device');
+                }
               }
 
               sessionManager.addSession(
@@ -510,8 +553,7 @@ export function createWebSocketGateway(
                 allDeviceIds: sessionManager.getOnlineDevices(newSessionState.userId),
               });
 
-              // Track device for per-user rate limiting
-              trackUserDevice(newSessionState.userId, newSessionState.deviceId);
+              // Device already tracked atomically above with tryTrackUserDevice
 
               // Update status to connected
               connectionStatuses.set(ws, 'connected');
@@ -526,8 +568,7 @@ export function createWebSocketGateway(
               // Store session in Redis for horizontal scaling
               await storeSession(redis, newSessionState);
 
-              // Increment connection count
-              incrementConnection(newSessionState.userId, newSessionState.deviceId);
+              // Connection count already incremented atomically in tryIncrementConnection above
 
               // Subscribe to Redis channel for this device
               try {
@@ -688,19 +729,16 @@ export function createWebSocketGateway(
 
             // Send ACK back to sender to confirm event was processed (or was a duplicate)
             // This allows the client to clean up its pending queue
-            try {
-              const eventPayload = message.payload as { device_seq?: number };
-              if (eventPayload.device_seq !== undefined) {
-                ws.send(JSON.stringify({
+            const eventPayload = message.payload as { device_seq?: number };
+            if (eventPayload.device_seq !== undefined) {
+              safeSend(
+                ws,
+                JSON.stringify({
                   type: 'ack',
                   payload: { device_seq: eventPayload.device_seq },
-                }));
-              }
-            } catch (ackError) {
-              logger.debug('Failed to send ACK', {
-                deviceId: sessionState.deviceId,
-                error: ackError instanceof Error ? ackError.message : String(ackError),
-              });
+                }),
+                { userId: sessionState.userId, deviceId: sessionState.deviceId }
+              );
             }
 
             // Check if keys should be rotated (based on session age)
@@ -723,26 +761,34 @@ export function createWebSocketGateway(
 
             // Update session in Redis (refresh TTL)
             await updateSession(redis, sessionState);
+            // Refresh presence cache TTL to match session TTL
+            await presenceBroadcaster.cacheDeviceStatus(
+              sessionState.userId,
+              sessionState.deviceId,
+              true
+            );
           } else if (message.type === 'ping') {
             // Respond to heartbeat ping with pong
-            try {
-              ws.send(
-                JSON.stringify({
-                  type: 'pong',
-                  payload: { timestamp: Date.now() },
-                })
-              );
-            } catch (error) {
-              logger.debug('Failed to send pong response', {
-                deviceId: sessionState.deviceId,
-              });
-            }
+            safeSend(
+              ws,
+              JSON.stringify({
+                type: 'pong',
+                payload: { timestamp: Date.now() },
+              }),
+              { userId: sessionState.userId, deviceId: sessionState.deviceId }
+            );
           } else if (message.type === 'replay_request') {
             await handleReplayRequest(message as ReplayRequest, sessionState, db, ws);
           } else if (message.type === 'ack') {
             await handleAck(message.payload, sessionState, db);
             // Update session in Redis
             await updateSession(redis, sessionState);
+            // Refresh presence cache TTL to match session TTL
+            await presenceBroadcaster.cacheDeviceStatus(
+              sessionState.userId,
+              sessionState.deviceId,
+              true
+            );
           } else if (message.type === 'initiate_pairing') {
             // Device initiates pairing - generates 6-digit code
             try {
@@ -751,14 +797,16 @@ export function createWebSocketGateway(
               }
               const code = await initiatePairing(redis, sessionState.userId, sessionState.deviceId);
               const expiresIn = 5 * 60 * 1000; // 5 minutes
-              ws.send(
+              safeSend(
+                ws,
                 JSON.stringify({
                   type: 'pairing_initiated',
                   payload: {
                     code,
                     expiresIn,
                   },
-                })
+                }),
+                { userId: sessionState.userId, deviceId: sessionState.deviceId }
               );
               logger.info('Pairing code generated', {
                 userId: sessionState.userId.substring(0, 12) + '...',
@@ -771,7 +819,8 @@ export function createWebSocketGateway(
                 deviceId: sessionState.deviceId,
                 error: error instanceof Error ? error.message : String(error),
               }, error);
-              ws.send(
+              safeSend(
+                ws,
                 JSON.stringify({
                   type: 'pairing_failed',
                   payload: {
@@ -784,13 +833,15 @@ export function createWebSocketGateway(
             // Device completes pairing - verifies code and links to initiating user
             const pairingCode = message.payload?.pairing_code;
             if (!pairingCode || typeof pairingCode !== 'string' || !/^\d{6}$/.test(pairingCode)) {
-              ws.send(
+              safeSend(
+                ws,
                 JSON.stringify({
                   type: 'pairing_failed',
                   payload: {
                     error: 'Invalid pairing code format',
                   },
-                })
+                }),
+                { userId: sessionState.userId, deviceId: sessionState.deviceId }
               );
               return;
             }
@@ -809,6 +860,7 @@ export function createWebSocketGateway(
                 // CRITICAL: We defer updating sessionState.userId until ALL operations succeed
                 // This prevents messages being processed with wrong userId during the transition
                 const oldUserId = sessionState.userId;
+                const oldLastAckDeviceSeq = sessionState.lastAckDeviceSeq; // Save for rollback
                 let subscriptionUpdated = false;
                 let sessionManagerUpdated = false;
                 let oldSubscriber: ReturnType<typeof subscribers.get> | null = null;
@@ -870,14 +922,16 @@ export function createWebSocketGateway(
                   });
 
                   // All updates successful - send confirmation
-                  ws.send(
+                  safeSend(
+                    ws,
                     JSON.stringify({
                       type: 'pairing_completed',
                       payload: {
                         success: true,
                         linkedUserId,
                       },
-                    })
+                    }),
+                    { userId: linkedUserId, deviceId: sessionState.deviceId }
                   );
 
                   // Broadcast pairing notification to all other devices of the new user
@@ -918,18 +972,21 @@ export function createWebSocketGateway(
                   // Rollback session manager if it was updated (transfer back to old user)
                   if (sessionManagerUpdated) {
                     try {
-                      // Revert sessionState.userId first
+                      // Revert sessionState fields first
                       sessionState.userId = oldUserId;
+                      sessionState.lastAckDeviceSeq = oldLastAckDeviceSeq;
                       // Transfer session back atomically
                       sessionManager.transferSession(linkedUserId, oldUserId, sessionState.deviceId, sessionState, ws);
                     } catch (rollbackError) {
                       logger.error('Failed to rollback session manager', {}, rollbackError);
-                      // Still try to revert sessionState.userId even if transfer failed
+                      // Still try to revert sessionState fields even if transfer failed
                       sessionState.userId = oldUserId;
+                      sessionState.lastAckDeviceSeq = oldLastAckDeviceSeq;
                     }
                   } else if (sessionState.userId !== oldUserId) {
-                    // sessionState.userId was changed but transfer wasn't complete
+                    // sessionState fields were changed but transfer wasn't complete
                     sessionState.userId = oldUserId;
+                    sessionState.lastAckDeviceSeq = oldLastAckDeviceSeq;
                   }
 
                   // Rollback subscription if it was updated
@@ -957,13 +1014,15 @@ export function createWebSocketGateway(
                   }
 
                   // Send failure message to client
-                  ws.send(
+                  safeSend(
+                    ws,
                     JSON.stringify({
                       type: 'pairing_failed',
                       payload: {
                         error: 'Failed to update session state after pairing. Please try again.',
                       },
-                    })
+                    }),
+                    { userId: sessionState.userId, deviceId: sessionState.deviceId }
                   );
                   return;
                 }
@@ -981,7 +1040,8 @@ export function createWebSocketGateway(
                 errorMessage,
               }, error);
 
-              ws.send(
+              safeSend(
+                ws,
                 JSON.stringify({
                   type: 'pairing_failed',
                   payload: {
@@ -995,11 +1055,7 @@ export function createWebSocketGateway(
           }
         }
 
-        // Decrement buffered message count after processing
-        const bufferedAfter = bufferedMessageCount.get(ws) || 0;
-        if (bufferedAfter > 0) {
-          bufferedMessageCount.set(ws, bufferedAfter - 1);
-        }
+        // Buffered message count is decremented in finally block (not here to avoid double decrement)
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
         const isProduction = process.env.NODE_ENV === 'production';
@@ -1108,46 +1164,64 @@ export function createWebSocketGateway(
       // Cleanup attached session state
       (ws as any)._sessionState = undefined;
 
-      // Cleanup subscriber
+      // Cleanup subscriber with timeout to prevent hanging
       const subscriber = subscribers.get(ws);
       if (subscriber) {
+        let cleanupSuccess = false;
         try {
-          // Unsubscribe from channel before quitting
-          if (subscriber.unsubscribe && typeof subscriber.unsubscribe === 'function') {
-            const channel = sessionState
-              ? `user:${sessionState.userId}:device:${sessionState.deviceId}`
-              : 'unknown';
-            await subscriber.unsubscribe(channel);
-            logger.debug('Unsubscribed from Redis channel', {
-              channel,
+          // Add timeout wrapper to prevent hanging indefinitely
+          await Promise.race([
+            (async () => {
+              // Unsubscribe from channel before quitting
+              if (subscriber.unsubscribe && typeof subscriber.unsubscribe === 'function') {
+                const channel = sessionState
+                  ? `user:${sessionState.userId}:device:${sessionState.deviceId}`
+                  : 'unknown';
+                await subscriber.unsubscribe(channel);
+                logger.debug('Unsubscribed from Redis channel', {
+                  channel,
+                  deviceId: sessionState?.deviceId,
+                });
+              }
+
+              // Quit the subscriber connection
+              if (subscriber.quit && typeof subscriber.quit === 'function') {
+                await subscriber.quit();
+              } else if (subscriber.disconnect && typeof subscriber.disconnect === 'function') {
+                await subscriber.disconnect();
+              }
+              cleanupSuccess = true;
+            })(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Redis cleanup timeout')), 5000)
+            ),
+          ]);
+
+          // Only decrement counter and remove from map if cleanup succeeded
+          if (cleanupSuccess) {
+            activeSubscriberCount = Math.max(0, activeSubscriberCount - 1);
+            setGauge('redis_subscribers_active', activeSubscriberCount);
+            subscribers.delete(ws);
+            logger.debug('Redis subscriber cleaned up successfully', {
               deviceId: sessionState?.deviceId,
+              activeSubscribers: activeSubscriberCount,
             });
           }
-
-          // Quit the subscriber connection
-          if (subscriber.quit && typeof subscriber.quit === 'function') {
-            await subscriber.quit();
-          } else if (subscriber.disconnect && typeof subscriber.disconnect === 'function') {
-            await subscriber.disconnect();
-          }
-
-          activeSubscriberCount = Math.max(0, activeSubscriberCount - 1);
-          setGauge('redis_subscribers_active', activeSubscriberCount);
-          logger.debug('Redis subscriber cleaned up', {
-            deviceId: sessionState?.deviceId,
-            activeSubscribers: activeSubscriberCount,
-          });
         } catch (error) {
           logger.error(
             'Failed to cleanup Redis subscriber',
             {
               deviceId: sessionState?.deviceId,
+              cleanupSuccess,
             },
             error instanceof Error ? error : new Error(String(error))
           );
           incrementCounter('redis_subscriber_cleanup_errors_total');
+
+          // Force remove from subscribers map even on error to prevent memory leak
+          // But don't decrement counter since cleanup failed
+          subscribers.delete(ws);
         }
-        subscribers.delete(ws);
       }
 
       // Cleanup heartbeat interval if still active
@@ -1348,20 +1422,26 @@ export function createWebSocketGateway(
 
     try {
       // Send device_revoked message to the device
-      ws.send(JSON.stringify({
-        type: 'device_revoked',
-        payload: {
+      const sent = safeSend(
+        ws,
+        JSON.stringify({
           type: 'device_revoked',
-          reason: reason || 'Device has been removed',
-          timestamp: Date.now(),
-        },
-      }));
+          payload: {
+            type: 'device_revoked',
+            reason: reason || 'Device has been removed',
+            timestamp: Date.now(),
+          },
+        }),
+        { userId, deviceId }
+      );
 
-      logger.info('Sent device_revoked notification', {
-        deviceId,
-        userId: userId.substring(0, 16) + '...',
-        reason: reason || 'Device has been removed',
-      });
+      if (sent) {
+        logger.info('Sent device_revoked notification', {
+          deviceId,
+          userId: userId.substring(0, 16) + '...',
+          reason: reason || 'Device has been removed',
+        });
+      }
 
       // Close the connection after a short delay to allow message delivery
       setTimeout(() => {
@@ -1406,16 +1486,18 @@ async function subscribeToDeviceChannel(
 
   await subscriber.subscribe(channel, (message: string) => {
     try {
-      if (ws.readyState === WebSocket.OPEN) {
-        const event = JSON.parse(message);
-        // Skip events sent by this device — the direct relay in event-handler.ts
-        // already delivered to other devices. Without this check, the sender
-        // receives its own events back via Redis pub/sub.
-        if (event.device_id === deviceId) {
-          return;
-        }
-        ws.send(JSON.stringify({ type: 'event', payload: event }));
+      const event = JSON.parse(message);
+      // Skip events sent by this device — the direct relay in event-handler.ts
+      // already delivered to other devices. Without this check, the sender
+      // receives its own events back via Redis pub/sub.
+      if (event.device_id === deviceId) {
+        return;
       }
+      safeSend(
+        ws,
+        JSON.stringify({ type: 'event', payload: event }),
+        { userId, deviceId }
+      );
     } catch (error) {
       logger.error(
         'Failed to forward event from Redis',
@@ -1549,7 +1631,30 @@ async function handleReplayRequest(
   db: Database,
   ws: WebSocket
 ): Promise<void> {
-  const { last_ack_device_seq, limit: requestedLimit, continuation_token } = request;
+  // Prevent concurrent replay requests to avoid duplicate deliveries
+  if (inFlightReplayRequests.get(ws)) {
+    logger.warn('Rejecting concurrent replay request', {
+      deviceId: sessionState.deviceId,
+      userId: sessionState.userId.substring(0, 16) + '...',
+    });
+    safeSend(
+      ws,
+      JSON.stringify({
+        type: 'replay_failed',
+        payload: {
+          error: 'Concurrent replay request rejected. Please wait for current replay to complete.',
+        },
+      }),
+      { userId: sessionState.userId, deviceId: sessionState.deviceId }
+    );
+    return;
+  }
+
+  // Mark replay as in-flight
+  inFlightReplayRequests.set(ws, true);
+
+  try {
+    const { last_ack_device_seq, limit: requestedLimit, continuation_token } = request;
 
   // Parse continuation token if provided (contains the device_seq to continue from)
   let startDeviceSeq = last_ack_device_seq;
@@ -1603,7 +1708,8 @@ async function handleReplayRequest(
         maxReplayAge,
       });
 
-      ws.send(
+      safeSend(
+        ws,
         JSON.stringify({
           type: 'full_resync_required',
           payload: {
@@ -1613,7 +1719,8 @@ async function handleReplayRequest(
             last_ack_device_seq,
             recommendation: 'Clear local state and re-sync from scratch',
           },
-        })
+        }),
+        { userId: sessionState.userId, deviceId: sessionState.deviceId }
       );
       return;
     }
@@ -1672,10 +1779,14 @@ async function handleReplayRequest(
       ...(totalEvents !== undefined && { total_events: totalEvents }),
     };
     // Send wrapped in WSMessage format for consistency
-    ws.send(JSON.stringify({
-      type: 'replay_response',
-      payload: emptyResponse,
-    }));
+    safeSend(
+      ws,
+      JSON.stringify({
+        type: 'replay_response',
+        payload: emptyResponse,
+      }),
+      { userId: sessionState.userId, deviceId: sessionState.deviceId }
+    );
     return;
   }
 
@@ -1698,10 +1809,18 @@ async function handleReplayRequest(
   };
 
   // Send wrapped in WSMessage format for consistency
-  ws.send(JSON.stringify({
-    type: 'replay_response',
-    payload: response,
-  }));
+  safeSend(
+    ws,
+    JSON.stringify({
+      type: 'replay_response',
+      payload: response,
+    }),
+    { userId: sessionState.userId, deviceId: sessionState.deviceId }
+  );
+  } finally {
+    // Always clear in-flight flag, even if replay fails
+    inFlightReplayRequests.delete(ws);
+  }
 }
 
 /**

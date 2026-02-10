@@ -157,17 +157,30 @@ export async function handleEvent(
   }
 
   // Validate device_seq hasn't been processed yet
-  // Use a set to track processed sequences to handle out-of-order delivery
-  // Initialize the set if it doesn't exist
+  // Use a sliding window to track recent processed sequences
+  // This prevents unbounded memory growth while detecting duplicates within a reasonable window
+  const DEDUP_WINDOW_SIZE = 1000; // Keep track of last 1000 sequences
+
+  // Initialize the dedup window if it doesn't exist
   if (!sessionState.processedDeviceSeqs) {
     sessionState.processedDeviceSeqs = new Set<number>();
-    // Add all sequences up to lastAckDeviceSeq as already processed
-    for (let i = 1; i <= sessionState.lastAckDeviceSeq; i++) {
-      sessionState.processedDeviceSeqs.add(i);
-    }
   }
 
-  // Check if this sequence was already processed (duplicate or replay attack)
+  // If sequence is older than our window (lastAckDeviceSeq - DEDUP_WINDOW_SIZE),
+  // we assume it's already been processed
+  const windowStart = Math.max(1, sessionState.lastAckDeviceSeq - DEDUP_WINDOW_SIZE);
+  if (encryptedEvent.device_seq < windowStart) {
+    logger.debug('Device sequence older than dedup window, treating as duplicate', {
+      eventDeviceSeq: encryptedEvent.device_seq,
+      windowStart,
+      sessionLastAckDeviceSeq: sessionState.lastAckDeviceSeq,
+      deviceId: sessionState.deviceId,
+      eventId: encryptedEvent.event_id,
+    });
+    return;
+  }
+
+  // Check if this sequence was already processed (duplicate)
   if (sessionState.processedDeviceSeqs.has(encryptedEvent.device_seq)) {
     logger.debug('Device sequence already processed (duplicate event, ignoring)', {
       eventDeviceSeq: encryptedEvent.device_seq,
@@ -177,21 +190,65 @@ export async function handleEvent(
       userId: sessionState.userId?.substring(0, 16) + '...',
       eventId: encryptedEvent.event_id,
     });
-    // Return early without error - duplicate events are silently accepted
-    // The client will receive success (no error) and can clean up its queue
     return;
   }
 
-  // Mark this sequence as being processed
+  // Mark this sequence as processed
   sessionState.processedDeviceSeqs.add(encryptedEvent.device_seq);
 
-  // Limit the set size to prevent memory issues (keep last 10000 sequences)
-  if (sessionState.processedDeviceSeqs.size > 10000) {
-    const seqsArray = Array.from(sessionState.processedDeviceSeqs).sort((a, b) => a - b);
-    const toRemove = seqsArray.slice(0, seqsArray.length - 5000);
-    for (const seq of toRemove) {
-      sessionState.processedDeviceSeqs.delete(seq);
+  // Clean up sequences outside the window (bounded cleanup)
+  if (sessionState.processedDeviceSeqs.size > DEDUP_WINDOW_SIZE * 1.5) {
+    // Remove all sequences older than windowStart
+    for (const seq of sessionState.processedDeviceSeqs) {
+      if (seq < windowStart) {
+        sessionState.processedDeviceSeqs.delete(seq);
+      }
     }
+  }
+
+  // GAP DETECTION: Check if device_seq indicates a gap in the sequence
+  // If current device_seq > lastAckDeviceSeq + 1, we're missing events
+  if (encryptedEvent.device_seq > sessionState.lastAckDeviceSeq + 1) {
+    const gap = encryptedEvent.device_seq - sessionState.lastAckDeviceSeq - 1;
+    const startSeq = sessionState.lastAckDeviceSeq + 1;
+    const endSeq = encryptedEvent.device_seq - 1;
+
+    logger.warn('Sequence gap detected', {
+      deviceId: sessionState.deviceId,
+      userId: sessionState.userId.substring(0, 16) + '...',
+      lastAckDeviceSeq: sessionState.lastAckDeviceSeq,
+      receivedDeviceSeq: encryptedEvent.device_seq,
+      gap,
+      missingRange: `${startSeq}-${endSeq}`,
+      eventId: encryptedEvent.event_id,
+    });
+
+    // Buffer this event (out-of-order) for processing after gap is filled
+    if (!sessionState.bufferedEvents) {
+      sessionState.bufferedEvents = new Map();
+    }
+    sessionState.bufferedEvents.set(encryptedEvent.device_seq, encryptedEvent);
+
+    // Request missing events from client
+    await sendMissingEventsRequest(
+      sessionState,
+      deviceRelay,
+      startSeq,
+      endSeq
+    );
+
+    // Increment gap detection metric
+    incrementCounter('sequence_gaps_detected_total', {
+      deviceId: sessionState.deviceId,
+    });
+
+    logger.info('Event buffered, waiting for gap fill', {
+      bufferedSeq: encryptedEvent.device_seq,
+      bufferSize: sessionState.bufferedEvents.size,
+    });
+
+    // Don't process this event yet - it will be processed after gap is filled
+    return;
   }
 
   // Assign stream_seq (get next sequence for this stream) with timeout and circuit breaker
@@ -347,6 +404,16 @@ export async function handleEvent(
       deviceSeq: encryptedEvent.device_seq,
       error: dbError instanceof Error ? dbError.message : String(dbError),
     });
+  }
+
+  // GAP FILL: Check if this event fills a gap and process buffered events
+  if (sessionState.bufferedEvents && sessionState.bufferedEvents.size > 0) {
+    await processBufferedEvents(
+      sessionState,
+      db,
+      redis,
+      deviceRelay
+    );
   }
 
   // Create event with server-assigned stream_seq
@@ -518,4 +585,156 @@ function isValidEncryptedEvent(event: unknown): event is EncryptedEvent {
     typeof e.encrypted_payload === 'string' &&
     (e.ttl === undefined || typeof e.ttl === 'number')
   );
+}
+
+/**
+ * Request missing events from client to fill sequence gap
+ */
+async function sendMissingEventsRequest(
+  sessionState: SessionState,
+  deviceRelay: DeviceRelay | undefined,
+  startSeq: number,
+  endSeq: number
+): Promise<void> {
+  if (!deviceRelay) {
+    logger.error('Cannot request missing events: deviceRelay not available');
+    return;
+  }
+
+  try {
+    const message = {
+      type: 'missing_events_request',
+      payload: {
+        startSeq,
+        endSeq,
+      },
+    };
+
+    // Send request directly to the device that has the gap
+    const sent = deviceRelay.sendToDevice(
+      sessionState.userId,
+      sessionState.deviceId,
+      message
+    );
+
+    if (!sent) {
+      throw new Error('Failed to send missing events request: device not connected');
+    }
+
+    logger.info('Sent missing events request to client', {
+      deviceId: sessionState.deviceId,
+      userId: sessionState.userId.substring(0, 16) + '...',
+      startSeq,
+      endSeq,
+      gap: endSeq - startSeq + 1,
+    });
+
+    // Increment metric
+    incrementCounter('missing_events_requests_sent_total', {
+      deviceId: sessionState.deviceId,
+    });
+  } catch (error) {
+    logger.error('Failed to send missing events request', {
+      deviceId: sessionState.deviceId,
+      startSeq,
+      endSeq,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * Process buffered out-of-order events after gap is filled
+ */
+async function processBufferedEvents(
+  sessionState: SessionState,
+  db: Database,
+  redis: RedisConnection,
+  deviceRelay?: DeviceRelay
+): Promise<void> {
+  if (!sessionState.bufferedEvents) return;
+
+  // Sort buffered events by device_seq
+  const buffered = Array.from(sessionState.bufferedEvents.entries())
+    .sort((a, b) => a[0] - b[0]);
+
+  let processed = 0;
+  let failed = 0;
+
+  for (const [seq, event] of buffered) {
+    // Check if we can now process this event
+    // Event can be processed if it's the next expected sequence
+    if (seq === sessionState.lastAckDeviceSeq + 1) {
+      try {
+        // Process the buffered event (recursive call to handleEvent)
+        await handleEvent(event, sessionState, db, redis, deviceRelay);
+
+        // Remove from buffer
+        sessionState.bufferedEvents.delete(seq);
+        processed++;
+
+        logger.info('Processed buffered event after gap fill', {
+          deviceSeq: seq,
+          eventId: event.event_id,
+          deviceId: sessionState.deviceId,
+        });
+      } catch (error) {
+        failed++;
+        logger.error('Failed to process buffered event', {
+          deviceSeq: seq,
+          eventId: event.event_id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // Keep in buffer for retry
+      }
+    } else if (seq < sessionState.lastAckDeviceSeq) {
+      // Event is now obsolete (gap was filled by resent event)
+      sessionState.bufferedEvents.delete(seq);
+      logger.debug('Removed obsolete buffered event', {
+        deviceSeq: seq,
+        lastAckDeviceSeq: sessionState.lastAckDeviceSeq,
+      });
+    }
+  }
+
+  if (processed > 0 || failed > 0) {
+    logger.info('Buffered events processing complete', {
+      processed,
+      failed,
+      remaining: sessionState.bufferedEvents.size,
+      deviceId: sessionState.deviceId,
+    });
+
+    // Increment metrics
+    incrementCounter('buffered_events_processed_total', {
+      status: 'success',
+      count: String(processed),
+    });
+    if (failed > 0) {
+      incrementCounter('buffered_events_processed_total', {
+        status: 'failed',
+        count: String(failed),
+      });
+    }
+  }
+
+  // Clean up buffer if it gets too large (prevent memory leak)
+  const MAX_BUFFER_SIZE = 100;
+  if (sessionState.bufferedEvents.size > MAX_BUFFER_SIZE) {
+    logger.warn('Buffer size exceeded limit, clearing old events', {
+      bufferSize: sessionState.bufferedEvents.size,
+      maxSize: MAX_BUFFER_SIZE,
+      deviceId: sessionState.deviceId,
+    });
+
+    // Keep only the most recent events
+    const sorted = Array.from(sessionState.bufferedEvents.keys()).sort((a, b) => b - a);
+    sorted.slice(MAX_BUFFER_SIZE).forEach(seq => {
+      sessionState.bufferedEvents!.delete(seq);
+    });
+
+    incrementCounter('buffer_overflow_events_discarded_total', {
+      discarded: String(sorted.length - MAX_BUFFER_SIZE),
+    });
+  }
 }

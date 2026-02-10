@@ -210,7 +210,41 @@ export function untrackUserDevice(userId: string, deviceId: string): void {
 }
 
 /**
+ * Atomically check limit and track device
+ * This prevents race conditions between check and track
+ */
+export function tryTrackUserDevice(
+  userId: string,
+  deviceId: string,
+  maxDevices: number = 5
+): { success: boolean; error?: string } {
+  const deviceCount = userDevices[userId]?.size || 0;
+
+  // Check limit
+  if (deviceCount >= maxDevices) {
+    logger.warn('User concurrent device limit exceeded', {
+      userId: userId.substring(0, 16) + '...',
+      deviceCount,
+      maxDevices,
+    });
+    return {
+      success: false,
+      error: `Too many devices connected (max ${maxDevices}). Please disconnect another device.`,
+    };
+  }
+
+  // Atomically track (no await between check and track)
+  if (!userDevices[userId]) {
+    userDevices[userId] = new Set();
+  }
+  userDevices[userId].add(deviceId);
+
+  return { success: true };
+}
+
+/**
  * Check concurrent device limit per user (max 5 devices per user)
+ * @deprecated Use tryTrackUserDevice for atomic check-and-track
  */
 export function checkConcurrentDeviceLimit(
   userId: string,

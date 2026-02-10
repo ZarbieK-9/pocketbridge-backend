@@ -279,7 +279,7 @@ export class MultiDeviceSessionManager {
    */
   invalidateDevice(userId: string, deviceId: string): boolean {
     const ws = this.getWebSocket(userId, deviceId);
-    if (ws) {
+    if (ws && (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING)) {
       ws.close(1000, 'Device revoked');
     }
     return this.removeSession(userId, deviceId) !== null;

@@ -17,7 +17,8 @@ const userConnections = new Map<string, number>();
 const deviceConnections = new Map<string, number>();
 
 /**
- * Check if new connection is allowed
+ * Check if new connection is allowed (DEPRECATED - use tryIncrementConnection instead)
+ * @deprecated Use tryIncrementConnection for atomic check-and-increment
  */
 export function checkConnectionLimit(
   userId: string,
@@ -46,7 +47,43 @@ export function checkConnectionLimit(
 }
 
 /**
- * Increment connection count
+ * Atomically check limit and increment connection count
+ * This prevents race conditions between check and increment
+ */
+export function tryIncrementConnection(
+  userId: string,
+  deviceId: string
+): { success: boolean; error?: string } {
+  const userCount = userConnections.get(userId) || 0;
+  const deviceCount = deviceConnections.get(deviceId) || 0;
+
+  // Check limits
+  if (userCount >= MAX_CONNECTIONS_PER_USER) {
+    logger.warn('User connection limit exceeded', { userId: userId.substring(0, 16) + '...' });
+    return {
+      success: false,
+      error: 'Maximum connections per user exceeded',
+    };
+  }
+
+  if (deviceCount >= MAX_CONNECTIONS_PER_DEVICE) {
+    logger.warn('Device connection limit exceeded', { deviceId });
+    return {
+      success: false,
+      error: 'Maximum connections per device exceeded',
+    };
+  }
+
+  // Atomically increment (no await between check and increment)
+  userConnections.set(userId, userCount + 1);
+  deviceConnections.set(deviceId, deviceCount + 1);
+
+  return { success: true };
+}
+
+/**
+ * Increment connection count (DEPRECATED - use tryIncrementConnection instead)
+ * @deprecated Use tryIncrementConnection for atomic check-and-increment
  */
 export function incrementConnection(userId: string, deviceId: string): void {
   const userCount = userConnections.get(userId) || 0;

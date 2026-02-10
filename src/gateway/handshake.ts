@@ -359,6 +359,13 @@ async function handleClientHello(
     };
 
     try {
+      if (ws.readyState !== WebSocket.OPEN) {
+        logger.warn('Cannot send server_hello: WebSocket not in OPEN state', {
+          readyState: ws.readyState,
+        });
+        resetHandshakeStateOnError(ws, 'websocket_not_open');
+        return { success: false };
+      }
       ws.send(JSON.stringify(response));
     } catch (sendError) {
       const errorContext = {
@@ -632,6 +639,13 @@ async function handleClientAuth(
     };
 
     try {
+      if (ws.readyState !== WebSocket.OPEN) {
+        logger.warn('Cannot send session_established: WebSocket not in OPEN state', {
+          readyState: ws.readyState,
+          deviceId: message.device_id,
+        });
+        return { success: false };
+      }
       ws.send(JSON.stringify(sessionEstablishedMessage));
     } catch (error) {
       const errorContext = {
