@@ -253,12 +253,14 @@ export async function handleEvent(
       pendingGapTimers.set(debounceKey, setTimeout(() => {
         pendingGapTimers.delete(debounceKey);
         // Re-check which sequences are still missing after the delay
+        const processedSeqs = sessionState.processedDeviceSeqs;
+        if (!processedSeqs || processedSeqs.size === 0) return;
         const stillMissing: number[] = [];
         const currentStart = sessionState.lastAckDeviceSeq + 1;
         // Use the highest device_seq we've seen so far
-        const highestSeen = Math.max(...Array.from(sessionState.processedDeviceSeqs));
+        const highestSeen = Math.max(...Array.from(processedSeqs));
         for (let seq = currentStart; seq < highestSeen; seq++) {
-          if (!sessionState.processedDeviceSeqs.has(seq)) {
+          if (!processedSeqs.has(seq)) {
             stillMissing.push(seq);
           }
         }
