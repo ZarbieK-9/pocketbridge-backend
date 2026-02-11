@@ -32,6 +32,12 @@ import { incrementCounter, recordHistogram } from '../services/metrics.js';
 import { databaseCircuitBreaker, redisCircuitBreaker } from '../services/circuit-breaker.js';
 import { isDeviceRevoked } from '../services/device-revocation.js';
 
+/** Delay before sending gap recovery requests, to let in-flight events arrive */
+const GAP_DEBOUNCE_MS = 200;
+
+/** Pending gap recovery timers keyed by deviceId */
+const pendingGapTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 /**
  * Handle incoming encrypted event
  *
@@ -211,33 +217,66 @@ export async function handleEvent(
   // NON-BLOCKING: Log the gap and request missing events, but still process
   // the current event immediately. Clients use Yjs CRDT which handles
   // out-of-order events, so strict ordering is not required for correctness.
+  //
+  // DEBOUNCED: We check processedDeviceSeqs to filter out sequences that
+  // arrived out-of-order but have already been processed. Only request
+  // sequences that are truly missing. Also debounce the request to avoid
+  // sending multiple requests when a burst of out-of-order events arrives.
   if (encryptedEvent.device_seq > sessionState.lastAckDeviceSeq + 1) {
-    const gap = encryptedEvent.device_seq - sessionState.lastAckDeviceSeq - 1;
     const startSeq = sessionState.lastAckDeviceSeq + 1;
     const endSeq = encryptedEvent.device_seq - 1;
 
-    logger.warn('Sequence gap detected (non-blocking)', {
-      deviceId: sessionState.deviceId,
-      userId: sessionState.userId.substring(0, 16) + '...',
-      lastAckDeviceSeq: sessionState.lastAckDeviceSeq,
-      receivedDeviceSeq: encryptedEvent.device_seq,
-      gap,
-      missingRange: `${startSeq}-${endSeq}`,
-      eventId: encryptedEvent.event_id,
-    });
+    // Filter out sequences we've already processed (arrived out-of-order)
+    const trulyMissing: number[] = [];
+    for (let seq = startSeq; seq <= endSeq; seq++) {
+      if (!sessionState.processedDeviceSeqs.has(seq)) {
+        trulyMissing.push(seq);
+      }
+    }
 
-    // Request missing events from client (best-effort, don't block)
-    sendMissingEventsRequest(
-      sessionState,
-      deviceRelay,
-      startSeq,
-      endSeq
-    ).catch(err => logger.warn('Failed to request missing events', { error: String(err) }));
+    if (trulyMissing.length > 0) {
+      logger.warn('Sequence gap detected (non-blocking)', {
+        deviceId: sessionState.deviceId,
+        userId: sessionState.userId.substring(0, 16) + '...',
+        lastAckDeviceSeq: sessionState.lastAckDeviceSeq,
+        receivedDeviceSeq: encryptedEvent.device_seq,
+        gap: trulyMissing.length,
+        missingRange: `${trulyMissing[0]}-${trulyMissing[trulyMissing.length - 1]}`,
+        eventId: encryptedEvent.event_id,
+      });
 
-    // Increment gap detection metric
-    incrementCounter('sequence_gaps_detected_total', {
-      deviceId: sessionState.deviceId,
-    });
+      // Debounce: schedule gap request after a short delay to let in-flight events arrive
+      const debounceKey = sessionState.deviceId;
+      if (pendingGapTimers.has(debounceKey)) {
+        clearTimeout(pendingGapTimers.get(debounceKey)!);
+      }
+      pendingGapTimers.set(debounceKey, setTimeout(() => {
+        pendingGapTimers.delete(debounceKey);
+        // Re-check which sequences are still missing after the delay
+        const stillMissing: number[] = [];
+        const currentStart = sessionState.lastAckDeviceSeq + 1;
+        // Use the highest device_seq we've seen so far
+        const highestSeen = Math.max(...Array.from(sessionState.processedDeviceSeqs));
+        for (let seq = currentStart; seq < highestSeen; seq++) {
+          if (!sessionState.processedDeviceSeqs.has(seq)) {
+            stillMissing.push(seq);
+          }
+        }
+        if (stillMissing.length > 0) {
+          sendMissingEventsRequest(
+            sessionState,
+            deviceRelay,
+            stillMissing[0],
+            stillMissing[stillMissing.length - 1]
+          ).catch(err => logger.warn('Failed to request missing events', { error: String(err) }));
+        }
+      }, GAP_DEBOUNCE_MS));
+
+      // Increment gap detection metric
+      incrementCounter('sequence_gaps_detected_total', {
+        deviceId: sessionState.deviceId,
+      });
+    }
 
     // Continue processing — don't block event relay
   }
