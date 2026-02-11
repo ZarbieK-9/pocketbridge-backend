@@ -1553,12 +1553,15 @@ async function updatePresence(redis: RedisConnection, deviceId: string, isOnline
  * Create HMAC-signed continuation token
  * Token is bound to device_id to prevent cross-device token reuse
  */
-function createContinuationToken(deviceSeq: number, deviceId: string): string {
-  const tokenData = {
-    device_seq: deviceSeq,
-    device_id: deviceId,
-    timestamp: Date.now(),
-  };
+function createContinuationToken(
+  data: number | { created_at: number; event_id: string },
+  deviceId: string
+): string {
+  // Support both old format (deviceSeq as number) and new format (object with created_at and event_id)
+  const tokenData = typeof data === 'number'
+    ? { device_seq: data, device_id: deviceId, timestamp: Date.now() }
+    : { created_at: data.created_at, event_id: data.event_id, device_id: deviceId, timestamp: Date.now() };
+
   const payload = JSON.stringify(tokenData);
 
   // Sign with server private key (or use a dedicated secret from config)
@@ -1576,11 +1579,12 @@ function createContinuationToken(deviceSeq: number, deviceId: string): string {
 /**
  * Verify and parse HMAC-signed continuation token
  * Returns null if token is invalid, tampered, or for a different device
+ * Supports both old format (device_seq) and new format (created_at, event_id)
  */
 function parseContinuationToken(
   token: string,
   deviceId: string
-): { device_seq: number; timestamp: number } | null {
+): { device_seq?: number; created_at?: number; event_id?: string; timestamp?: number } | null {
   try {
     const parts = token.split('.');
     if (parts.length !== 2) {
@@ -1667,17 +1671,27 @@ async function handleReplayRequest(
   try {
     const { last_ack_device_seq, limit: requestedLimit, continuation_token } = request;
 
-  // Parse continuation token if provided (contains the device_seq to continue from)
-  let startDeviceSeq = last_ack_device_seq;
+  // Get device's last received event timestamp for global event tracking
+  const deviceResult = await db.pool.query(
+    `SELECT last_received_created_at FROM user_devices WHERE device_id = $1::uuid`,
+    [sessionState.deviceId]
+  );
+  const lastReceivedAt = deviceResult.rows[0]?.last_received_created_at || new Date(0);
+
+  // Parse continuation token if provided (contains the created_at to continue from)
+  let startCreatedAt = lastReceivedAt;
+  let startEventId = '';
   if (continuation_token) {
     const tokenData = parseContinuationToken(continuation_token, sessionState.deviceId);
     if (tokenData) {
-      startDeviceSeq = tokenData.device_seq;
+      // Token contains: { created_at, event_id }
+      startCreatedAt = new Date(tokenData.created_at);
+      startEventId = tokenData.event_id;
     } else {
-      logger.warn('Invalid or tampered continuation token, using last_ack_device_seq', {
+      logger.warn('Invalid or tampered continuation token, using lastReceivedAt', {
         deviceId: sessionState.deviceId,
       });
-      startDeviceSeq = last_ack_device_seq;
+      startCreatedAt = lastReceivedAt;
     }
   }
 
@@ -1695,11 +1709,11 @@ async function handleReplayRequest(
   let totalEvents: number | undefined;
   if (!continuation_token) {
     const countResult = await db.pool.query(
-      `SELECT COUNT(*) as total FROM events 
-       WHERE device_id = $1 
-       AND device_seq > $2 
+      `SELECT COUNT(*) as total FROM events
+       WHERE user_id = $1
+       AND created_at > $2
        AND created_at > $3`,
-      [sessionState.deviceId, last_ack_device_seq, cutoffTime]
+      [sessionState.userId, startCreatedAt, cutoffTime]
     );
 
     totalEvents = parseInt(countResult.rows[0].total, 10);
@@ -1738,16 +1752,33 @@ async function handleReplayRequest(
   }
 
   // Query events with pagination (request one extra to check if there are more)
+  // Use >= for created_at to include events with same timestamp, and event_id as tiebreaker
   const queryLimit = pageLimit + 1;
-  const result = await db.pool.query(
-    `SELECT * FROM events 
-     WHERE device_id = $1 
-     AND device_seq > $2 
-     AND created_at > $3
-     ORDER BY device_seq ASC
-     LIMIT $4`,
-    [sessionState.deviceId, startDeviceSeq, cutoffTime, queryLimit]
-  );
+
+  // Build parameterized query for proper pagination that handles same-timestamp events
+  let query: string;
+  let params: any[];
+
+  // If continuing from a previous page, use >= with event_id tiebreaker
+  if (continuation_token && startEventId) {
+    query = `SELECT * FROM events
+             WHERE user_id = $1
+             AND (created_at > $2 OR (created_at = $2 AND event_id > $4))
+             AND created_at > $3
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT $5`;
+    params = [sessionState.userId, startCreatedAt, cutoffTime, startEventId, queryLimit];
+  } else {
+    query = `SELECT * FROM events
+             WHERE user_id = $1
+             AND created_at > $2
+             AND created_at > $3
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT $4`;
+    params = [sessionState.userId, startCreatedAt, cutoffTime, queryLimit];
+  }
+
+  const result = await db.pool.query(query, params);
 
   // Check if there are more events
   const hasMore = result.rows.length > pageLimit;
@@ -1771,7 +1802,23 @@ async function handleReplayRequest(
   if (hasMore && events.length > 0) {
     const lastEvent = events[events.length - 1];
     // Use signed token to prevent tampering and cross-device reuse
-    continuationToken = createContinuationToken(lastEvent.device_seq, sessionState.deviceId);
+    // Token now contains: { created_at, event_id } for global ordering
+    continuationToken = createContinuationToken(
+      { created_at: lastEvent.created_at, event_id: lastEvent.event_id },
+      sessionState.deviceId
+    );
+  }
+
+  // Update device's last received event for global tracking
+  const maxCreatedAt = events.length > 0 ? new Date(events[events.length - 1].created_at) : startCreatedAt;
+  const lastEventId = events.length > 0 ? events[events.length - 1].event_id : '';
+  if (events.length > 0) {
+    await db.pool.query(
+      `UPDATE user_devices
+       SET last_received_created_at = $1, last_received_event_id = $2
+       WHERE device_id = $3::uuid`,
+      [maxCreatedAt, lastEventId, sessionState.deviceId]
+    );
   }
 
   // Edge case: No events to replay
