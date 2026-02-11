@@ -111,7 +111,7 @@ const corsOptions: cors.CorsOptions = {
   credentials: config.cors.credentials,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   // Include custom headers used by frontend
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID', 'X-Requested-With'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID', 'X-Requested-With', 'ngrok-skip-browser-warning'],
   optionsSuccessStatus: 200,
   preflightContinue: false,
 };
