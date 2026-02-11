@@ -771,11 +771,13 @@ export function createWebSocketGateway(
             // Direct relay for scratchpad Yjs updates
             // No storage, no sequence tracking, no ACKs
             // Yjs CRDT handles convergence and conflict resolution natively
-            await deviceRelay.broadcastSystemMessage(
+            console.log('[ScratchpadSync:BACKEND] Received scratchpad_sync from device:', sessionState.deviceId, 'user:', sessionState.userId.substring(0, 16) + '...');
+            const relayResult = await deviceRelay.broadcastSystemMessage(
               sessionState.userId,
               { type: 'scratchpad_sync', payload: message.payload },
               sessionState.deviceId // exclude sender
             );
+            console.log('[ScratchpadSync:BACKEND] Relay result — sent:', relayResult.sent, 'failed:', relayResult.failed);
           } else if (message.type === 'ping') {
             // Respond to heartbeat ping with pong
             safeSend(
