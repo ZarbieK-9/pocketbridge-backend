@@ -138,8 +138,8 @@ export async function jwtAuthMiddleware(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  // Skip auth for health and metrics
-  if (req.path === '/health' || req.path === '/metrics') {
+  // Skip auth for health, metrics, and pairing lookup (new devices have no identity yet)
+  if (req.path === '/health' || req.path === '/metrics' || req.path.startsWith('/pairing/lookup/')) {
     return next();
   }
 
