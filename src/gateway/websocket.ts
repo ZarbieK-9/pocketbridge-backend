@@ -1683,10 +1683,10 @@ async function handleReplayRequest(
   let startEventId = '';
   if (continuation_token) {
     const tokenData = parseContinuationToken(continuation_token, sessionState.deviceId);
-    if (tokenData) {
+    if (tokenData && tokenData.created_at !== undefined && tokenData.event_id) {
       // Token contains: { created_at, event_id }
       startCreatedAt = new Date(tokenData.created_at);
-      startEventId = tokenData.event_id;
+      startEventId = tokenData.event_id || '';
     } else {
       logger.warn('Invalid or tampered continuation token, using lastReceivedAt', {
         deviceId: sessionState.deviceId,
@@ -1826,7 +1826,7 @@ async function handleReplayRequest(
     logger.debug('Replay request returned no events (empty state)', {
       deviceId: sessionState.deviceId,
       userId: sessionState.userId.substring(0, 16) + '...',
-      last_ack_device_seq: startDeviceSeq,
+      startCreatedAt: startCreatedAt.toISOString(),
     });
 
     const emptyResponse: ReplayResponse = {
