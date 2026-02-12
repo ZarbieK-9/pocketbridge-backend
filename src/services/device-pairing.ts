@@ -155,9 +155,12 @@ export async function completePairing(
         throw new ValidationError('Pairing code expired');
       }
 
-      // Check if same user trying to pair with self
+      // If same user is trying to pair again, they're already paired — treat as success
       if (pairingSession.initiatingUserId === joiningUserId) {
-        throw new ValidationError('Cannot pair device with same user');
+        pairingSession.used = true;
+        pairingSession.completedAt = Date.now();
+        await redis.client.setEx(key, Math.ceil(PAIRING_CODE_EXPIRY / 1000), JSON.stringify(pairingSession));
+        return { success: true, linkedUserId: joiningUserId, message: 'Devices already paired under the same user.' };
       }
 
       const initiatingUserId = pairingSession.initiatingUserId;
