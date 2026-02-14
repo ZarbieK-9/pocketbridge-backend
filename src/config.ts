@@ -293,7 +293,7 @@ export const config: Config = {
             'https://pocketbridge.vercel.app',
             'http://pocketbridge.duckdns.org',
             'https://pocketbridge.duckdns.org',
-            'https://terraqueous-nonmarketable-burt.ngrok-free.dev',
+            'https://showmanly-proevolutionary-kasie.ngrok-free.dev',
           ] // Production frontends
         : '*', // Allow all in development
     credentials: process.env.CORS_CREDENTIALS === 'true',
